@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Household Power Optimization</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Room-Local Smart Home Simulator</p>
+        <h1>Smart home simulator.</h1>
+      </div>
+      <div class="hero-card">
+        <p class="mono">Live tariff</p>
+        <strong id="tariffValue">₹0.00 / kWh</strong>
+        <span id="deviceMode">Mode: simulation</span>
+      </div>
+    </section>
+
+    <div class="view-tabs" id="viewTabs">
+      <button class="view-tab active" type="button" data-view="home">Home</button>
+      <button class="view-tab" type="button" data-view="dashboard">Dashboard</button>
+    </div>
+
+    <section id="homeView" class="view-panel active">
+      <section class="panel home-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Smart Home View</p>
+            <h2>Room-Local Simulator</h2>
+          </div>
+          <div class="legend">
+            <span><i class="legend-dot light"></i>LED brightness</span>
+            <span><i class="legend-dot fan"></i>Fan speed and room-local sensors</span>
+          </div>
+        </div>
+        <div class="smart-home-topline">
+          <div class="mini-metric">
+            <span>Active Power</span>
+            <strong id="activePower">0 W</strong>
+          </div>
+          <div class="mini-metric">
+            <span>Hourly Cost</span>
+            <strong id="hourlyCost">₹0.00</strong>
+          </div>
+          <div class="mini-metric">
+            <span>Session Cost</span>
+            <strong id="sessionCost">₹0.00</strong>
+          </div>
+          <div class="mini-metric">
+            <span>Daily Projection</span>
+            <strong id="dailyCost">₹0.00</strong>
+          </div>
+        </div>
+        <div id="houseGrid" class="house-grid"></div>
+      </section>
+
+      <section class="grid two-up">
+        <article class="panel">
+          <p class="eyebrow">Action Layer</p>
+          <h2>Smart Assist</h2>
+          <p id="modeDescription" class="panel-copy">User changes apply immediately. Optimization and energy corrections continue in the background instead of forcing a visible mode switch.</p>
+          <button id="runDecisionButton" class="full">Run Evaluation Now</button>
+          <div id="deviceMessage" class="callout muted">Awaiting controller activity.</div>
+        </article>
+
+        <article class="panel">
+          <p class="eyebrow">Voice / LLM Layer</p>
+          <h2>Room-Local Voice Commands</h2>
+          <div class="status-list">
+            <div class="status-item"><span>Voice input</span><strong>Browser STT</strong></div>
+            <div class="status-item"><span>Command parsing</span><strong>Nano model -> strict JSON</strong></div>
+            <div class="status-item"><span>Execution</span><strong>Room-local only</strong></div>
+            <div class="status-item"><span>Fallback</span><strong>Deterministic parser</strong></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <p class="eyebrow">Analysis Layer</p>
+          <h2>Live Summary</h2>
+          <div class="status-list" id="analysisStatus"></div>
+          <h3>Energy Insights</h3>
+          <ul id="insightsList" class="list"></ul>
+        </article>
+
+        <article class="panel">
+          <p class="eyebrow">Decision Layer</p>
+          <h2>Automation Activity</h2>
+          <div id="activitySummary" class="callout">No recent automated adjustments.</div>
+          <details class="log-drawer">
+            <summary>Show decision log</summary>
+            <div id="decisionLog" class="log-list"></div>
+          </details>
+        </article>
+      </section>
+    </section>
+
+    <section id="dashboardView" class="view-panel">
+      <section class="panel dashboard-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Optimization & Prediction</p>
+            <h2>Dashboard</h2>
+          </div>
+          <div class="range-toggle" id="dashboardRangeTabs">
+            <button class="range-chip active" type="button" data-range="today">Today</button>
+            <button class="range-chip" type="button" data-range="week">7 Days</button>
+          </div>
+        </div>
+        <div class="dashboard-summary" id="dashboardSummary"></div>
+        <div class="dashboard-grid">
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Room-wise energy</h3>
+              <span class="subtle">Room comparison</span>
+            </div>
+            <div id="roomComparisonChart" class="chart-stack"></div>
+          </article>
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Hourly trend</h3>
+              <span class="subtle">Power and cost pattern</span>
+            </div>
+            <div id="hourlyTrendChart" class="chart-stack"></div>
+          </article>
+        </div>
+        <div class="dashboard-grid dashboard-grid-secondary">
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Recommendations</h3>
+              <span class="subtle">Prediction and policy preview</span>
+            </div>
+            <div id="recommendationsPanel" class="recommendation-list"></div>
+          </article>
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Inefficiencies</h3>
+              <span class="subtle">Waste and idle load</span>
+            </div>
+            <div id="inefficiencyPanel" class="recommendation-list"></div>
+          </article>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

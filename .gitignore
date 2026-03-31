@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+.pytest_cache/
+power_optimization.db
+local_settings.json
