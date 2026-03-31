@@ -11,6 +11,7 @@ class LightControlState(str, Enum):
 @dataclass(frozen=True)
 class LightPolicyConfig:
     hold_duration_sec: int = 120
+    min_occupied_brightness: int = 12
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,15 @@ class LightPolicyResult:
     hold_remaining_sec: int
     explanation: str
     runtime: LightPolicyRuntime
+
+
+def describe_runtime(runtime: LightPolicyRuntime, now_epoch: int) -> dict:
+    return {
+        "state": runtime.phase.value,
+        "hold_remaining_sec": max(0, runtime.hold_until_epoch - now_epoch),
+        "user_brightness": runtime.user_brightness,
+        "reason": runtime.last_reason,
+    }
 
 
 def runtime_from_record(record: Optional[dict]) -> LightPolicyRuntime:
@@ -80,7 +90,11 @@ def evaluate_light_policy(
     now_epoch: int,
     config: LightPolicyConfig,
 ) -> LightPolicyResult:
-    auto_target = recommended_brightness(occupancy_count, ambient_light)
+    auto_target = recommended_brightness(
+        occupancy_count,
+        ambient_light,
+        min_occupied_brightness=config.min_occupied_brightness,
+    )
     hold_remaining = max(0, runtime.hold_until_epoch - now_epoch)
     if hold_remaining > 0 and runtime.user_brightness is not None:
         next_runtime = LightPolicyRuntime(
@@ -113,18 +127,39 @@ def evaluate_light_policy(
     )
 
 
-def recommended_brightness(occupancy_count: int, ambient_light: float) -> int:
+def release_hold_for_sensor_intent(
+    runtime: LightPolicyRuntime,
+    *,
+    now_epoch: int,
+    config: LightPolicyConfig,
+) -> LightPolicyRuntime:
+    hold_remaining = max(0, runtime.hold_until_epoch - now_epoch)
+    if hold_remaining <= 0 or runtime.user_brightness is None:
+        return runtime
+    recent_intent_window = max(10, min(30, config.hold_duration_sec // 4))
+    if hold_remaining <= recent_intent_window:
+        return runtime
+    return LightPolicyRuntime(
+        hold_until_epoch=0,
+        user_brightness=None,
+        phase=LightControlState.ASSIST,
+        last_reason="Ambient conditions changed, so light assistance resumed for this room.",
+    )
+
+
+def recommended_brightness(occupancy_count: int, ambient_light: float, *, min_occupied_brightness: int = 12) -> int:
     if occupancy_count <= 0:
         return 0
-    return interpolate_brightness(float(ambient_light))
+    return interpolate_brightness(float(ambient_light), min_occupied_brightness=min_occupied_brightness)
 
 
-def interpolate_brightness(ambient_light: float) -> int:
+def interpolate_brightness(ambient_light: float, *, min_occupied_brightness: int = 12) -> int:
     points = [
         (0.0, 85),
         (20.0, 65),
         (45.0, 35),
-        (75.0, 0),
+        (75.0, 18),
+        (100.0, max(8, min_occupied_brightness)),
     ]
     if ambient_light <= points[0][0]:
         return points[0][1]

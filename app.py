@@ -13,10 +13,13 @@ from control.fan_policy import (
 )
 from control.light_policy import (
     apply_manual_light_intent,
+    describe_runtime as describe_light_runtime,
+    release_hold_for_sensor_intent as release_light_hold_for_sensor_intent,
     runtime_from_record as light_runtime_from_record,
     runtime_to_record as light_runtime_to_record,
 )
 from database import (
+    update_runtime_meter_state,
     build_recent_activity_summary,
     get_fan_policy_states,
     get_light_policy_states,
@@ -24,6 +27,7 @@ from database import (
     get_global_mode,
     get_recent_decision_logs,
     get_recent_room_sensor_readings,
+    get_runtime_meter_states,
     get_room_modes,
     get_latest_room_sensor_readings,
     init_db,
@@ -38,11 +42,16 @@ from decision_engine import (
     DEFAULT_FAN_POLICY_CONFIG,
     DEFAULT_LIGHT_POLICY_CONFIG,
     TARIFF_PER_KWH,
+    attach_runtime_tokens,
     build_dashboard_payload,
     build_insights,
     build_room_metrics,
     calculate_metrics,
+    current_power_tokens,
+    current_rate_tokens,
+    current_billing_rate_tokens,
     evaluate_rules,
+    token_delta,
 )
 from device_controller import build_device_controller
 from home_layout import ROOM_MODE_OPTIONS, ROOMS, build_rooms_payload
@@ -68,6 +77,7 @@ def build_snapshot():
         for room_id in ROOMS
     }
     metrics = calculate_metrics(room_sensors, appliances)
+    room_meters, system_meter = advance_runtime_meters(room_metrics, metrics, now_epoch)
     _, pattern, _, _ = evaluate_rules(
         room_sensors,
         appliances,
@@ -84,15 +94,22 @@ def build_snapshot():
         "deployment_model": "single-node-raspberry-pi",
         "device_mode": device_controller.get_mode(),
         "global_mode": global_mode,
-        "metrics": metrics,
+        "metrics": attach_runtime_tokens(metrics, system_meter),
         "rooms": build_rooms_payload(
             appliances,
             room_sensors,
             room_modes,
             global_mode,
-            room_metrics,
+            {
+                room_id: attach_runtime_tokens(room_metrics[room_id], room_meters.get(room_id))
+                for room_id in ROOMS
+            },
             {
                 room_id: describe_runtime(runtime_from_record(fan_policy_states.get(room_id)), now_epoch)
+                for room_id in ROOMS
+            },
+            {
+                room_id: describe_light_runtime(light_runtime_from_record(light_policy_states.get(room_id)), now_epoch)
                 for room_id in ROOMS
             },
         ),
@@ -100,7 +117,56 @@ def build_snapshot():
         "dashboard": dashboard,
         "recent_decisions": get_recent_decision_logs(limit=30),
         "activity_summary": build_recent_activity_summary(limit=4),
+}
+
+
+def advance_runtime_meters(room_metrics, metrics, now_epoch):
+    meter_states = get_runtime_meter_states()
+    room_meters = {}
+    for room_id in ROOMS:
+        previous = meter_states.get(room_id, {})
+        elapsed_hours = max(0.0, min(0.25, (now_epoch - float(previous.get("last_tick_epoch", now_epoch) or now_epoch)) / 3600))
+        current_power = current_power_tokens(room_metrics[room_id]["active_power_watts"])
+        current_rate = current_billing_rate_tokens(room_metrics[room_id]["hourly_cost_inr"])
+        session_tokens = float(previous.get("session_tokens", 0.0)) + max(0.0, current_power * elapsed_hours * 0.85)
+        billing_tokens = float(previous.get("billing_tokens", 0.0)) + max(0.0, current_rate * elapsed_hours)
+        update_runtime_meter_state(
+            room_id,
+            room_id=room_id,
+            current_power_tokens=current_power,
+            current_rate_tokens=current_rate,
+            session_tokens=session_tokens,
+            billing_tokens=billing_tokens,
+            now_epoch=now_epoch,
+        )
+        room_meters[room_id] = {
+            "current_power_tokens": current_power,
+            "current_rate_tokens": current_rate,
+            "session_tokens": session_tokens,
+            "billing_tokens": billing_tokens,
+            "last_tick_epoch": now_epoch,
+        }
+    previous_system = meter_states.get("system", {})
+    elapsed_hours = max(0.0, min(0.25, (now_epoch - float(previous_system.get("last_tick_epoch", now_epoch) or now_epoch)) / 3600))
+    system_session_tokens = float(previous_system.get("session_tokens", 0.0)) + max(0.0, current_power_tokens(metrics["active_power_watts"]) * elapsed_hours * 0.85)
+    system_billing_tokens = float(previous_system.get("billing_tokens", 0.0)) + max(0.0, current_billing_rate_tokens(metrics["hourly_cost_inr"]) * elapsed_hours)
+    system_meter = {
+        "current_power_tokens": current_power_tokens(metrics["active_power_watts"]),
+        "current_rate_tokens": current_billing_rate_tokens(metrics["hourly_cost_inr"]),
+        "session_tokens": system_session_tokens,
+        "billing_tokens": system_billing_tokens,
+        "last_tick_epoch": now_epoch,
     }
+    update_runtime_meter_state(
+        "system",
+        room_id=None,
+        current_power_tokens=system_meter["current_power_tokens"],
+        current_rate_tokens=system_meter["current_rate_tokens"],
+        session_tokens=system_meter["session_tokens"],
+        billing_tokens=system_meter["billing_tokens"],
+        now_epoch=now_epoch,
+    )
+    return room_meters, system_meter
 
 
 def log_action(room_id, appliance, action, reason, source, appliances):
@@ -244,6 +310,7 @@ def sensor_reading():
     target_rooms = [room_id] if room_id in ROOMS else list(ROOMS)
     previous_sensors = get_latest_room_sensor_readings()
     policy_states = get_fan_policy_states()
+    light_policy_states = get_light_policy_states()
     now_epoch = time()
     for target_room in target_rooms:
         previous = previous_sensors[target_room]
@@ -262,6 +329,14 @@ def sensor_reading():
             )
             if next_runtime != runtime_from_record(policy_states.get(target_room)):
                 save_fan_policy_state(target_room, runtime_to_record(next_runtime))
+        if light_sensor_intent_changed(previous_sensors[target_room], reading):
+            next_light_runtime = release_light_hold_for_sensor_intent(
+                light_runtime_from_record(light_policy_states.get(target_room)),
+                now_epoch=now_epoch,
+                config=DEFAULT_LIGHT_POLICY_CONFIG,
+            )
+            if next_light_runtime != light_runtime_from_record(light_policy_states.get(target_room)):
+                save_light_policy_state(target_room, light_runtime_to_record(next_light_runtime))
     actions = run_decision_cycle()
     snapshot = build_snapshot()
     snapshot["latest_actions"] = actions
@@ -426,6 +501,13 @@ def climate_intent_changed(previous_reading, next_reading):
         abs(float(previous_reading["temperature"]) - float(next_reading["temperature"])) >= 0.5
         or int(previous_reading["occupancy_count"]) != int(next_reading["occupancy_count"])
         or abs(float(previous_reading["ambient_light"]) - float(next_reading["ambient_light"])) >= 2.0
+    )
+
+
+def light_sensor_intent_changed(previous_reading, next_reading):
+    return (
+        int(previous_reading["occupancy_count"]) != int(next_reading["occupancy_count"])
+        or abs(float(previous_reading["ambient_light"]) - float(next_reading["ambient_light"])) >= 4.0
     )
 
 

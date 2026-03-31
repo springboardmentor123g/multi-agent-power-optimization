@@ -40,24 +40,24 @@
             <span><i class="legend-dot fan"></i>Fan speed and room-local sensors</span>
           </div>
         </div>
-        <div class="smart-home-topline">
-          <div class="mini-metric">
-            <span>Active Power</span>
-            <strong id="activePower">0 W</strong>
-          </div>
-          <div class="mini-metric">
-            <span>Hourly Cost</span>
-            <strong id="hourlyCost">₹0.00</strong>
-          </div>
-          <div class="mini-metric">
-            <span>Session Cost</span>
-            <strong id="sessionCost">₹0.00</strong>
-          </div>
-          <div class="mini-metric">
-            <span>Daily Projection</span>
-            <strong id="dailyCost">₹0.00</strong>
-          </div>
+      <div class="smart-home-topline">
+        <div class="mini-metric">
+          <span>Power Tokens</span>
+          <strong id="activePower">0 tok</strong>
         </div>
+        <div class="mini-metric">
+          <span>Rate Tokens</span>
+          <strong id="hourlyCost">0 tok/hr</strong>
+        </div>
+        <div class="mini-metric">
+          <span>Bill Tokens</span>
+          <strong id="sessionCost">0 tok</strong>
+        </div>
+        <div class="mini-metric">
+          <span>Daily Tokens</span>
+          <strong id="dailyCost">0 tok</strong>
+        </div>
+      </div>
         <div id="houseGrid" class="house-grid"></div>
       </section>
 
@@ -114,6 +114,22 @@
           </div>
         </div>
         <div class="dashboard-summary" id="dashboardSummary"></div>
+        <div class="dashboard-filters">
+          <div class="range-toggle" id="dashboardRoomFilters">
+            <button class="range-chip active" type="button" data-room-filter="all">All rooms</button>
+            <button class="range-chip" type="button" data-room-filter="living_room">Living</button>
+            <button class="range-chip" type="button" data-room-filter="bedroom">Bedroom</button>
+            <button class="range-chip" type="button" data-room-filter="kitchen">Kitchen</button>
+            <button class="range-chip" type="button" data-room-filter="study">Study</button>
+          </div>
+          <div class="range-toggle" id="dashboardMetricFilters">
+            <button class="range-chip active" type="button" data-metric-filter="cost">Cost</button>
+            <button class="range-chip" type="button" data-metric-filter="energy">Energy</button>
+            <button class="range-chip" type="button" data-metric-filter="fan">Fan</button>
+            <button class="range-chip" type="button" data-metric-filter="light">Light</button>
+            <button class="range-chip" type="button" data-metric-filter="occupancy">Occupancy</button>
+          </div>
+        </div>
         <div class="dashboard-grid">
           <article class="dashboard-card">
             <div class="dashboard-card-head">

@@ -172,7 +172,7 @@ class PowerOptimizationTestCase(unittest.TestCase):
         light = payload["rooms"]["bedroom"]["devices"]["light"]
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(light["brightness"], 18)
+        self.assertEqual(light["brightness"], 26)
 
     def test_manual_fan_control_starts_hold_policy(self):
         response = self.client.post(
@@ -233,6 +233,7 @@ class PowerOptimizationTestCase(unittest.TestCase):
     def test_metrics_react_aggressively_to_room_load_changes(self):
         baseline = self.client.get("/api/system-state").get_json()
         baseline_power = baseline["metrics"]["active_power_watts"]
+        baseline_rate_tokens = baseline["rooms"]["living_room"]["metrics"]["rate_tokens"]
 
         response = self.client.post(
             "/api/sensor-reading",
@@ -249,6 +250,87 @@ class PowerOptimizationTestCase(unittest.TestCase):
         self.assertGreater(payload["metrics"]["active_power_watts"], baseline_power)
         self.assertGreater(payload["rooms"]["living_room"]["metrics"]["active_power_watts"], 0)
         self.assertGreater(payload["metrics"]["hourly_cost_inr"], baseline["metrics"]["hourly_cost_inr"])
+        self.assertGreater(payload["rooms"]["living_room"]["metrics"]["rate_tokens"], baseline_rate_tokens)
+
+    def test_ambient_light_change_updates_light_output_when_hold_not_active(self):
+        self.client.post(
+            "/api/sensor-reading",
+            json={
+                "room_id": "bedroom",
+                "temperature": 25,
+                "ambient_light": 10,
+                "occupancy_count": 1,
+            },
+        )
+
+        response = self.client.post(
+            "/api/sensor-reading",
+            json={
+                "room_id": "bedroom",
+                "temperature": 25,
+                "ambient_light": 70,
+                "occupancy_count": 1,
+            },
+        )
+        payload = response.get_json()
+        light = payload["rooms"]["bedroom"]["devices"]["light"]
+
+        self.assertEqual(response.status_code, 201)
+        self.assertLessEqual(light["brightness"], 21)
+
+    def test_light_toggle_on_uses_room_sensor_recommendation_not_fixed_value(self):
+        self.client.post(
+            "/api/sensor-reading",
+            json={
+                "room_id": "bedroom",
+                "temperature": 25,
+                "ambient_light": 50,
+                "occupancy_count": 1,
+            },
+        )
+        self.client.post("/api/control/appliance", json={"appliance": "bedroom_light", "level": 0})
+
+        response = self.client.post(
+            "/api/control/appliance",
+            json={"appliance": "bedroom_light", "level": 29},
+        )
+        payload = response.get_json()
+        light = payload["rooms"]["bedroom"]["devices"]["light"]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(light["brightness"], 29)
+
+    def test_billing_rate_tokens_remain_proportional_after_brightness_change(self):
+        baseline = self.client.get("/api/system-state").get_json()
+        baseline_rate = baseline["rooms"]["bedroom"]["metrics"]["rate_tokens"]
+
+        response = self.client.post(
+            "/api/control/appliance",
+            json={"appliance": "bedroom_light", "level": 80},
+        )
+        payload = response.get_json()
+        room_metrics = payload["rooms"]["bedroom"]["metrics"]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreater(room_metrics["rate_tokens"], baseline_rate)
+        self.assertLess(room_metrics["rate_tokens"] - baseline_rate, 400)
+
+    def test_auto_light_zero_stays_armed_on_in_vacant_bright_room(self):
+        response = self.client.post(
+            "/api/sensor-reading",
+            json={
+                "room_id": "bedroom",
+                "temperature": 25,
+                "ambient_light": 95,
+                "occupancy_count": 0,
+            },
+        )
+        payload = response.get_json()
+        light = payload["rooms"]["bedroom"]["devices"]["light"]
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(light["state"], "ON")
+        self.assertEqual(light["brightness"], 0)
 
     def test_repeated_evaluations_keep_hot_room_speed_stable(self):
         response = self.client.post(

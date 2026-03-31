@@ -98,6 +98,17 @@ def init_db():
                 last_reason TEXT NOT NULL DEFAULT 'Initialized.',
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS runtime_meter_state (
+                meter_key TEXT PRIMARY KEY,
+                room_id TEXT,
+                current_power_tokens REAL NOT NULL DEFAULT 0,
+                current_rate_tokens REAL NOT NULL DEFAULT 0,
+                session_tokens REAL NOT NULL DEFAULT 0,
+                billing_tokens REAL NOT NULL DEFAULT 0,
+                last_tick_epoch REAL NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
         ensure_appliance_state_columns(connection)
@@ -186,11 +197,30 @@ def init_db():
                 """,
                 (room_id,),
             )
+            connection.execute(
+                """
+                INSERT INTO runtime_meter_state (
+                    meter_key, room_id
+                )
+                VALUES (?, ?)
+                ON CONFLICT(meter_key) DO NOTHING
+                """,
+                (room_id, room_id),
+            )
         connection.execute(
             """
             INSERT INTO system_settings (key, value)
             VALUES ('global_mode', 'AUTO')
             ON CONFLICT(key) DO NOTHING
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO runtime_meter_state (
+                meter_key, room_id
+            )
+            VALUES ('system', NULL)
+            ON CONFLICT(meter_key) DO NOTHING
             """
         )
         connection.commit()
@@ -574,6 +604,50 @@ def get_recent_decision_logs(limit=20):
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def get_runtime_meter_states():
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT meter_key, room_id, current_power_tokens, current_rate_tokens,
+                   session_tokens, billing_tokens, last_tick_epoch, updated_at
+            FROM runtime_meter_state
+            ORDER BY meter_key ASC
+            """
+        ).fetchall()
+    return {row["meter_key"]: dict(row) for row in rows}
+
+
+def update_runtime_meter_state(meter_key, *, room_id, current_power_tokens, current_rate_tokens, session_tokens, billing_tokens, now_epoch):
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO runtime_meter_state (
+                meter_key, room_id, current_power_tokens, current_rate_tokens,
+                session_tokens, billing_tokens, last_tick_epoch, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(meter_key) DO UPDATE SET
+                room_id = excluded.room_id,
+                current_power_tokens = excluded.current_power_tokens,
+                current_rate_tokens = excluded.current_rate_tokens,
+                session_tokens = excluded.session_tokens,
+                billing_tokens = excluded.billing_tokens,
+                last_tick_epoch = excluded.last_tick_epoch,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                meter_key,
+                room_id,
+                float(current_power_tokens),
+                float(current_rate_tokens),
+                float(session_tokens),
+                float(billing_tokens),
+                float(now_epoch),
+            ),
+        )
+        connection.commit()
 
 
 def build_recent_activity_summary(limit=4):

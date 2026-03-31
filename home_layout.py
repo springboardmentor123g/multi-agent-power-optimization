@@ -110,8 +110,9 @@ def resolve_room_mode(global_mode, room_mode):
     return global_mode
 
 
-def build_rooms_payload(appliances, room_sensors, room_modes, global_mode, room_metrics, fan_policy=None):
+def build_rooms_payload(appliances, room_sensors, room_modes, global_mode, room_metrics, fan_policy=None, light_policy=None):
     fan_policy = fan_policy or {}
+    light_policy = light_policy or {}
     rooms = {}
     for room_id, room in ROOMS.items():
         light = appliances[f"{room_id}_light"]
@@ -140,6 +141,7 @@ def build_rooms_payload(appliances, room_sensors, room_modes, global_mode, room_
                     "brightness": light["level"],
                     "color": room["light_color"],
                     "power_watts": light["power_watts"],
+                    "policy": light_policy.get(room_id, {}),
                 },
                 "fan": {
                     "id": fan["name"],

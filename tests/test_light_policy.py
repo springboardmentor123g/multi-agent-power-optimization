@@ -14,9 +14,12 @@ class LightPolicyTestCase(unittest.TestCase):
         ]
         self.assertEqual(values, sorted(values, reverse=True))
         self.assertEqual(values[0], 85)
-        self.assertEqual(values[-1], 0)
-        self.assertEqual(recommended_brightness(1, 50), 29)
-        self.assertEqual(recommended_brightness(1, 60), 18)
+        self.assertEqual(values[-1], 18)
+        self.assertEqual(recommended_brightness(1, 50), 32)
+        self.assertEqual(recommended_brightness(1, 60), 26)
+
+    def test_recommended_brightness_keeps_nonzero_floor_when_occupied(self):
+        self.assertEqual(recommended_brightness(1, 100), 12)
 
 
 if __name__ == "__main__":

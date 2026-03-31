@@ -11,7 +11,12 @@ let latestAppliedSnapshotId = 0;
 let activeRecognition = null;
 let activeListeningRoomId = null;
 let latestSnapshot = null;
+let latestSnapshotRenderedAt = 0;
 let dashboardRange = "today";
+let dashboardRoomFilter = "all";
+let dashboardMetricFilter = "cost";
+const UI_POWER_TOKEN_SCALE = 1.42;
+const UI_BILLING_RATE_TOKEN_SCALE = 960;
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 function voiceLog(event, payload = {}) {
@@ -54,6 +59,7 @@ async function requestSnapshot(url, options = {}) {
 
 function renderSnapshot(snapshot) {
   latestSnapshot = snapshot;
+  latestSnapshotRenderedAt = performance.now();
   document.getElementById("tariffValue").textContent = `₹${snapshot.tariff_inr_per_kwh.toFixed(2)} / kWh`;
   document.getElementById("deviceMode").textContent = `Mode: ${snapshot.device_mode} · ${snapshot.deployment_model}`;
   renderGlobalMetrics(snapshot.metrics);
@@ -91,10 +97,10 @@ function renderSnapshot(snapshot) {
 }
 
 function renderGlobalMetrics(metrics) {
-  animateMetricValue(document.getElementById("activePower"), Number(metrics.active_power_watts), { suffix: " W", decimals: 0 });
-  animateMetricValue(document.getElementById("hourlyCost"), Number(metrics.hourly_cost_inr), { prefix: "₹", decimals: 2 });
-  animateMetricValue(document.getElementById("sessionCost"), Number(metrics.session_cost_inr), { prefix: "₹", decimals: 2 });
-  animateMetricValue(document.getElementById("dailyCost"), Number(metrics.daily_cost_projection_inr), { prefix: "₹", decimals: 2 });
+  animateMetricValue(document.getElementById("activePower"), Number(metrics.power_tokens || 0), { suffix: " tok", decimals: 0 });
+  animateMetricValue(document.getElementById("hourlyCost"), Number(metrics.rate_tokens || 0), { suffix: " tok/hr", decimals: 0 });
+  primeLiveMeter(document.getElementById("sessionCost"), Number(metrics.billing_tokens || 0), Number(metrics.rate_tokens || 0), " tok");
+  animateMetricValue(document.getElementById("dailyCost"), Number(metrics.daily_projection_tokens || 0), { suffix: " tok", decimals: 0 });
 }
 
 function statusRow(label, value) {
@@ -134,7 +140,7 @@ function buildRoomCard(room) {
       </div>
       <div class="room-actions">
         <span class="room-badge" id="room-badge-${room.id}"></span>
-        <button class="mic-button" type="button" data-room-id="${room.id}" data-voice-kind="mic" id="voice-mic-${room.id}" aria-label="Speak a command for ${room.name}">Mic</button>
+        <button class="mic-button" type="button" data-room-id="${room.id}" data-voice-kind="mic" id="voice-mic-${room.id}" aria-label="Speak a command for ${room.name}">🎙</button>
         <details class="sensor-popover" id="sensor-popover-${room.id}">
           <summary class="sensor-chip">Sensors</summary>
           <div class="sensor-flyout sensor-panel compact">
@@ -280,7 +286,7 @@ function updateRoomCard(card, room) {
   card.voiceDebug.textContent = voiceDebug;
   card.micButton.classList.toggle("listening", activeListeningRoomId === room.id);
   card.micButton.disabled = !SpeechRecognition;
-  card.micButton.textContent = activeListeningRoomId === room.id ? "Listening" : "Mic";
+  card.micButton.textContent = activeListeningRoomId === room.id ? "◉" : "🎙";
   card.root.classList.toggle("light-on", lightOn);
   card.root.style.setProperty("--light-color", light.color);
   card.root.style.setProperty("--room-glow", glow);
@@ -298,11 +304,11 @@ function updateRoomCard(card, room) {
   if (occupancyStepper) {
     occupancyStepper.textContent = String(room.sensors.occupancy_count);
   }
-  animateMetricValue(card.roomPower, Number(room.metrics.active_power_watts), { suffix: " W", decimals: 0 });
-  animateMetricValue(card.roomCost, Number(room.metrics.hourly_cost_inr), { prefix: "₹", suffix: "/hr", decimals: 2 });
+  animateMetricValue(card.roomPower, Number(room.metrics.power_tokens || 0), { suffix: " tok", decimals: 0 });
+  primeLiveMeter(card.roomCost, Number(room.metrics.billing_tokens || 0), Number(room.metrics.rate_tokens || 0), " tok");
 
   card.lightToggle.classList.toggle("on", lightOn);
-  card.lightToggle.dataset.level = lightOn ? "0" : String(recommendedLightStartupLevel(room));
+  card.lightToggle.dataset.level = lightOn ? "0" : String(explicitLightToggleLevel(room));
   card.lightToggle.disabled = false;
 
   card.fanToggle.classList.toggle("on", fanSwitchOn);
@@ -370,7 +376,9 @@ function updateSlider(root, roomId, key, value, suffix, disabled, isDevice = fal
   const labelNode = root.querySelector(`#${labelId}`);
   if (slider) {
     slider.disabled = disabled;
-    const isUserAdjusting = slider.dataset.userAdjusting === "true" || document.activeElement === slider;
+    const isUserAdjusting = slider.dataset.userAdjusting === "true"
+      || slider.dataset.syncPending === "true"
+      || document.activeElement === slider;
     if (options.animate && !isUserAdjusting) {
       animateSliderValue(slider, labelNode, targetValue, suffix, options.onFrame);
     } else {
@@ -475,6 +483,41 @@ function animateMetricValue(node, targetValue, options = {}) {
   metricAnimations.set(animationKey, frameId);
 }
 
+function stopMetricAnimation(node) {
+  const animationKey = node.id || node.textContent;
+  const existing = metricAnimations.get(animationKey);
+  if (existing) {
+    cancelAnimationFrame(existing);
+    metricAnimations.delete(animationKey);
+  }
+}
+
+function primeLiveMeter(node, baseValue, ratePerHour, suffix) {
+  if (!node) {
+    return;
+  }
+  stopMetricAnimation(node);
+  const safeBase = Number(baseValue || 0);
+  const existingValue = Number(node.dataset.numericValue || safeBase);
+  const monotonicBase = Math.max(existingValue, safeBase);
+  node.dataset.liveBase = String(monotonicBase);
+  node.dataset.liveRate = String(Number(ratePerHour || 0));
+  node.dataset.numericValue = String(monotonicBase);
+  node.textContent = `${monotonicBase.toFixed(1)}${suffix}`;
+}
+
+function updateLiveMeterRate(node, ratePerHour, suffix) {
+  if (!node) {
+    return;
+  }
+  stopMetricAnimation(node);
+  const currentVisible = Number(node.dataset.numericValue || node.dataset.liveBase || 0);
+  node.dataset.liveBase = String(currentVisible);
+  node.dataset.liveRate = String(Number(ratePerHour || 0));
+  node.dataset.numericValue = String(currentVisible);
+  node.textContent = `${currentVisible.toFixed(1)}${suffix}`;
+}
+
 function easeInOutCubic(value) {
   return value < 0.5
     ? 4 * value * value * value
@@ -538,6 +581,11 @@ function recommendedLightStartupLevel(room) {
   return 0;
 }
 
+function explicitLightToggleLevel(room) {
+  const recommended = recommendedLightStartupLevel(room);
+  return recommended > 0 ? recommended : 12;
+}
+
 function formatPolicyState(state) {
   const labels = {
     hold: "Holding",
@@ -574,6 +622,39 @@ function estimateRoomPowerForUI(room) {
   return Number((lightPower + fanPower + occupancyLoad).toFixed(2));
 }
 
+function applyFanVisualPreview(card, speedPercent, switchOn = true) {
+  const value = Math.max(0, Math.min(100, Number(speedPercent || 0)));
+  card.fanStatus.textContent = `${value}% ${switchOn || value > 0 ? "preview" : "off"}`;
+  card.fanToggle.classList.toggle("on", !!switchOn);
+  card.fanRotor.style.animationDuration = fanDuration(value);
+  card.fanRotor.style.animationPlayState = switchOn ? "running" : "paused";
+  card.fanSlider.value = String(value);
+  const fanValueNode = card.root.querySelector(`#device-value-${card.root.dataset.roomId}-fan`);
+  if (fanValueNode) {
+    fanValueNode.textContent = `${value}%`;
+  }
+}
+
+function applyLightVisualPreview(card, brightness, switchOn = true) {
+  const value = Math.max(0, Math.min(100, Number(brightness || 0)));
+  const isOn = !!switchOn;
+  const roomColor = getComputedStyle(card.root).getPropertyValue("--light-color").trim() || "#ffd36b";
+  card.lightStatus.textContent = `${value}% brightness`;
+  card.lightToggle.classList.toggle("on", isOn);
+  card.root.classList.toggle("light-on", isOn && value > 0);
+  card.root.style.setProperty("--room-glow", hexToRgba(roomColor, isOn ? Math.max(0.08, value / 100) : 0.03));
+  card.root.style.setProperty("--room-glow-soft", hexToRgba(roomColor, isOn ? Math.max(0.06, value / 260) : 0.02));
+  card.lightSlider.value = String(value);
+  const lightValueNode = card.root.querySelector(`#device-value-${card.root.dataset.roomId}-light`);
+  if (lightValueNode) {
+    lightValueNode.textContent = `${value}%`;
+  }
+  card.leds.forEach((led) => {
+    led.classList.toggle("on", isOn && value > 0);
+    led.style.opacity = isOn ? String(Math.max(0.2, value / 100)) : "0.28";
+  });
+}
+
 function calculateSnapshotMetricsForUI(rooms, tariff) {
   const roomEntries = Object.values(rooms);
   const roomMetrics = {};
@@ -582,12 +663,19 @@ function calculateSnapshotMetricsForUI(rooms, tariff) {
   roomEntries.forEach((room) => {
     const power = estimateRoomPowerForUI(room);
     const hourly = Number(((power / 1000) * tariff).toFixed(2));
-    const runtimeBias = 0.28 + (Number(room.devices.fan.speed_percent || 0) / 1000) + (Number(room.devices.light.brightness || 0) / 1400);
-    const roomSession = Number((hourly * (1 + runtimeBias)).toFixed(2));
+    const powerTokens = Number((power * UI_POWER_TOKEN_SCALE).toFixed(1));
+    const rateTokens = Number((hourly * UI_BILLING_RATE_TOKEN_SCALE).toFixed(1));
+    const runtimeBias = 0.18 + (Number(room.devices.fan.speed_percent || 0) / 1500) + (Number(room.devices.light.brightness || 0) / 1800);
+    const roomSession = Number((rateTokens * (0.08 + runtimeBias)).toFixed(1));
     roomMetrics[room.id] = {
       active_power_watts: Number(power.toFixed(2)),
       hourly_cost_inr: hourly,
-      session_cost_inr: roomSession,
+      session_cost_inr: Number((hourly * (1 + runtimeBias)).toFixed(2)),
+      power_tokens: powerTokens,
+      rate_tokens: rateTokens,
+      session_tokens: roomSession,
+      billing_tokens: roomSession,
+      daily_projection_tokens: Number((rateTokens * 24).toFixed(1)),
     };
     activePower += power;
     sessionCost += roomSession;
@@ -598,8 +686,13 @@ function calculateSnapshotMetricsForUI(rooms, tariff) {
     globalMetrics: {
       active_power_watts: Number(activePower.toFixed(2)),
       hourly_cost_inr: hourlyCost,
-      session_cost_inr: Number(sessionCost.toFixed(2)),
+      session_cost_inr: Number((sessionCost / 88).toFixed(2)),
       daily_cost_projection_inr: Number((hourlyCost * 24).toFixed(2)),
+      power_tokens: Number((activePower * UI_POWER_TOKEN_SCALE).toFixed(1)),
+      rate_tokens: Number((hourlyCost * UI_BILLING_RATE_TOKEN_SCALE).toFixed(1)),
+      session_tokens: Number(sessionCost.toFixed(1)),
+      billing_tokens: Number(sessionCost.toFixed(1)),
+      daily_projection_tokens: Number((hourlyCost * UI_BILLING_RATE_TOKEN_SCALE * 24).toFixed(1)),
     },
   };
 }
@@ -638,17 +731,69 @@ function previewMetricsForRoom(roomId, overrides = {}) {
     targetRoom.devices.fan.speed_percent = Number(overrides.fan_speed_percent);
     targetRoom.devices.fan.state = overrides.fan_state || targetRoom.devices.fan.state;
   }
+  const sensorDrivenPreview = (
+    overrides.temperature !== undefined
+    || overrides.ambient_light !== undefined
+    || overrides.occupancy_count !== undefined
+  );
+  if (sensorDrivenPreview) {
+    const fanHeld = targetRoom.devices.fan.policy?.state === "hold";
+    const lightHeld = targetRoom.devices.light.policy?.state === "hold";
+    if (!fanHeld) {
+      const predictedFan = recommendedFanStartupLevel(targetRoom);
+      targetRoom.devices.fan.speed_percent = predictedFan;
+      targetRoom.devices.fan.state = "ON";
+      const card = roomElements.get(roomId);
+      if (card) {
+        applyFanVisualPreview(card, predictedFan, true);
+      }
+    }
+    if (!lightHeld) {
+      const predictedLight = recommendedLightStartupLevel(targetRoom);
+      targetRoom.devices.light.brightness = predictedLight;
+      targetRoom.devices.light.state = predictedLight > 0 ? "ON" : "OFF";
+      const card = roomElements.get(roomId);
+      if (card) {
+        applyLightVisualPreview(card, predictedLight, predictedLight > 0);
+      }
+    }
+  }
   const { roomMetrics, globalMetrics } = calculateSnapshotMetricsForUI(projectedRooms, tariff);
   Object.entries(roomMetrics).forEach(([id, metric]) => {
     const card = roomElements.get(id);
     if (!card) {
       return;
     }
-    animateMetricValue(card.roomPower, metric.active_power_watts, { suffix: " W", decimals: 0 });
-    animateMetricValue(card.roomCost, metric.hourly_cost_inr, { prefix: "₹", suffix: "/hr", decimals: 2 });
+    animateMetricValue(card.roomPower, metric.power_tokens, { suffix: " tok", decimals: 0 });
+    updateLiveMeterRate(card.roomCost, metric.rate_tokens, " tok");
   });
-  renderGlobalMetrics(globalMetrics);
+  animateMetricValue(document.getElementById("activePower"), Number(globalMetrics.power_tokens || 0), { suffix: " tok", decimals: 0 });
+  animateMetricValue(document.getElementById("hourlyCost"), Number(globalMetrics.rate_tokens || 0), { suffix: " tok/hr", decimals: 0 });
+  updateLiveMeterRate(document.getElementById("sessionCost"), Number(globalMetrics.rate_tokens || 0), " tok");
+  animateMetricValue(document.getElementById("dailyCost"), Number(globalMetrics.daily_projection_tokens || 0), { suffix: " tok", decimals: 0 });
   renderDashboard(buildDashboardPreview(projectedRooms, roomMetrics, globalMetrics));
+}
+
+function tickLiveTokenMeters() {
+  if (!latestSnapshotRenderedAt) {
+    return;
+  }
+  const elapsedSeconds = Math.max(0, (performance.now() - latestSnapshotRenderedAt) / 1000);
+  const globalMeter = document.getElementById("sessionCost");
+  if (globalMeter) {
+    const base = Number(globalMeter.dataset.liveBase || 0);
+    const rate = Number(globalMeter.dataset.liveRate || 0);
+    const nextValue = base + ((rate / 3600) * elapsedSeconds);
+    globalMeter.dataset.numericValue = String(nextValue);
+    globalMeter.textContent = `${nextValue.toFixed(1)} tok`;
+  }
+  roomElements.forEach((card) => {
+    const base = Number(card.roomCost.dataset.liveBase || 0);
+    const rate = Number(card.roomCost.dataset.liveRate || 0);
+    const nextValue = base + ((rate / 3600) * elapsedSeconds);
+    card.roomCost.dataset.numericValue = String(nextValue);
+    card.roomCost.textContent = `${nextValue.toFixed(1)} tok`;
+  });
 }
 
 function formatOccupancyLevel(count) {
@@ -663,8 +808,8 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
     .map((room) => ({
       room_id: room.id,
       name: room.name,
-      energy_kwh: Number(((roomMetrics[room.id].active_power_watts * 4.2) / 1000).toFixed(2)),
-      cost_inr: Number((roomMetrics[room.id].hourly_cost_inr * 4.2).toFixed(2)),
+      energy_kwh: Number(((roomMetrics[room.id].power_tokens * 4.2) / 1000).toFixed(2)),
+      cost_inr: Number((roomMetrics[room.id].rate_tokens * 0.12).toFixed(2)),
       avg_fan_percent: Number(room.devices.fan.speed_percent || 0),
       avg_light_percent: Number(room.devices.light.brightness || 0),
       occupancy_score: Number(room.sensors.occupancy_count || 0),
@@ -673,12 +818,12 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
   const peak = comparison[0] || { name: "Living Room" };
   return {
     summary: {
-      total_energy_today_kwh: Number(((globalMetrics.active_power_watts * 4.2) / 1000).toFixed(2)),
-      total_cost_today_inr: Number((globalMetrics.hourly_cost_inr * 4.2).toFixed(2)),
+      total_energy_today_kwh: Number(((globalMetrics.power_tokens * 4.2) / 1000).toFixed(2)),
+      total_cost_today_inr: Number((globalMetrics.rate_tokens * 0.5).toFixed(2)),
       highest_consuming_room: peak.name,
       peak_usage_hour: "Live",
-      efficiency_score: Number(Math.max(58, 100 - globalMetrics.hourly_cost_inr * 8).toFixed(1)),
-      savings_opportunity_percent: Number(Math.min(26, Math.max(8, globalMetrics.hourly_cost_inr * 10)).toFixed(1)),
+      efficiency_score: Number(Math.max(58, 100 - globalMetrics.rate_tokens * 0.08).toFixed(1)),
+      savings_opportunity_percent: Number(Math.min(26, Math.max(8, globalMetrics.rate_tokens * 0.1)).toFixed(1)),
     },
     room_comparison: comparison,
     hourly_trend: comparison.slice(0, 4).map((item, index) => ({
@@ -706,24 +851,59 @@ function renderDashboard(dashboard) {
   if (!dashboard) {
     return;
   }
+  const roomComparison = (dashboard.room_comparison || []).filter((item) => (
+    dashboardRoomFilter === "all" ? true : item.room_id === dashboardRoomFilter
+  ));
+  const metricAccessor = {
+    cost: (item) => ({ value: item.cost_inr, label: `${scaleDashboardValue(item.cost_inr).toFixed(2)} bill tok` }),
+    energy: (item) => ({ value: item.energy_kwh, label: `${scaleDashboardValue(item.energy_kwh).toFixed(2)} energy tok` }),
+    fan: (item) => ({ value: item.avg_fan_percent, label: `${item.avg_fan_percent.toFixed(0)}% avg fan` }),
+    light: (item) => ({ value: item.avg_light_percent, label: `${item.avg_light_percent.toFixed(0)}% avg light` }),
+    occupancy: (item) => ({ value: item.occupancy_score, label: `${item.occupancy_score.toFixed(1)} persons` }),
+  }[dashboardMetricFilter];
   const summary = dashboard.summary || {};
   document.getElementById("dashboardSummary").innerHTML = [
-    summaryCard("Total energy", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0)).toFixed(2)} kWh`),
-    summaryCard("Total cost", `₹${scaleDashboardValue(Number(summary.total_cost_today_inr || 0)).toFixed(2)}`),
+    summaryCard("Energy tokens", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0)).toFixed(2)} tok`),
+    summaryCard("Bill tokens", `${scaleDashboardValue(Number(summary.total_cost_today_inr || 0)).toFixed(2)} tok`),
     summaryCard("Highest room", summary.highest_consuming_room || "N/A"),
     summaryCard("Peak usage", summary.peak_usage_hour || "N/A"),
     summaryCard("Efficiency", `${Number(summary.efficiency_score || 0).toFixed(1)} · Save ${Number(summary.savings_opportunity_percent || 0).toFixed(1)}%`),
   ].join("");
 
-  const roomMax = Math.max(1, ...dashboard.room_comparison.map((item) => item.cost_inr || 0));
-  document.getElementById("roomComparisonChart").innerHTML = dashboard.room_comparison
-    .map((item) => chartRow(item.name, `₹${scaleDashboardValue(item.cost_inr).toFixed(2)} · ${item.avg_fan_percent.toFixed(0)}% fan`, (item.cost_inr / roomMax) * 100))
-    .join("");
+  const roomChartData = roomComparison.map((item) => {
+    const metric = metricAccessor(item);
+    return {
+      label: item.name,
+      value: metric.value,
+      meta: metric.label,
+    };
+  });
+  document.getElementById("roomComparisonChart").innerHTML = renderBarChartSvg(roomChartData, {
+    height: 320,
+    gradientId: "roomBarGradient",
+  });
 
-  const trendMax = Math.max(1, ...dashboard.hourly_trend.map((item) => item.power_watts || 0));
-  document.getElementById("hourlyTrendChart").innerHTML = dashboard.hourly_trend
-    .map((item) => chartRow(item.hour, `${item.power_watts.toFixed(0)} W · ₹${scaleDashboardValue(item.cost_inr).toFixed(2)}`, (item.power_watts / trendMax) * 100, "cost"))
-    .join("");
+  const trendMetricValue = {
+    cost: (item) => ({ value: item.cost_inr, label: `${scaleDashboardValue(item.cost_inr).toFixed(2)} bill tok` }),
+    energy: (item) => ({ value: item.power_watts, label: `${item.power_watts.toFixed(0)} power tok` }),
+    fan: (item) => ({ value: item.activity * 12, label: `${item.activity} activity` }),
+    light: (item) => ({ value: item.activity * 9, label: `${item.activity} lighting load` }),
+    occupancy: (item) => ({ value: item.activity, label: `${item.activity} activity` }),
+  }[dashboardMetricFilter];
+  const trendChartData = dashboard.hourly_trend.map((item) => {
+    const metric = trendMetricValue(item);
+    return {
+      label: item.hour,
+      value: metric.value,
+      meta: metric.label,
+    };
+  });
+  document.getElementById("hourlyTrendChart").innerHTML = renderLineChartSvg(trendChartData, {
+    height: 320,
+    stroke: "#4a8f86",
+    fill: "rgba(74, 143, 134, 0.14)",
+    point: "#bd632f",
+  });
 
   document.getElementById("recommendationsPanel").innerHTML = [
     ...(dashboard.recommendations || []),
@@ -741,16 +921,95 @@ function summaryCard(label, value) {
   return `<div class="summary-chip"><span>${label}</span><strong>${value}</strong></div>`;
 }
 
-function chartRow(label, value, widthPercent, extraClass = "") {
+function renderBarChartSvg(data, options = {}) {
+  if (!data.length) {
+    return `<div class="chart-empty">No chart data yet.</div>`;
+  }
+  const width = 640;
+  const height = options.height || 320;
+  const padding = { top: 22, right: 18, bottom: 74, left: 18 };
+  const innerWidth = width - padding.left - padding.right;
+  const innerHeight = height - padding.top - padding.bottom;
+  const maxValue = Math.max(1, ...data.map((item) => item.value || 0));
+  const gap = 18;
+  const barWidth = Math.max(42, (innerWidth - gap * (data.length - 1)) / data.length);
+  const bars = data
+    .map((item, index) => {
+      const scaledHeight = (item.value / maxValue) * innerHeight;
+      const x = padding.left + index * (barWidth + gap);
+      const y = padding.top + (innerHeight - scaledHeight);
+      return `
+        <g class="chart-bar-group">
+          <rect x="${x}" y="${y}" width="${barWidth}" height="${scaledHeight}" rx="16" fill="url(#${options.gradientId || "barGradient"})"></rect>
+          <text x="${x + barWidth / 2}" y="${height - 36}" text-anchor="middle" class="svg-axis-label">${item.label}</text>
+          <text x="${x + barWidth / 2}" y="${y - 10}" text-anchor="middle" class="svg-value-label">${item.meta}</text>
+        </g>
+      `;
+    })
+    .join("");
+  const gridLines = [0.25, 0.5, 0.75, 1]
+    .map((step) => {
+      const y = padding.top + innerHeight - innerHeight * step;
+      return `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="svg-grid-line"></line>`;
+    })
+    .join("");
   return `
-    <div class="chart-row">
-      <div class="chart-row-top">
-        <span class="chart-row-label">${label}</span>
-        <strong>${value}</strong>
-      </div>
-      <div class="chart-bar-track">
-        <div class="chart-bar-fill ${extraClass}" style="width:${Math.max(6, widthPercent)}%"></div>
-      </div>
+    <div class="chart-svg-wrap">
+      <svg viewBox="0 0 ${width} ${height}" class="chart-svg" role="img" aria-label="Room comparison chart">
+        <defs>
+          <linearGradient id="${options.gradientId || "barGradient"}" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#bd632f"></stop>
+            <stop offset="100%" stop-color="#4a8f86"></stop>
+          </linearGradient>
+        </defs>
+        ${gridLines}
+        ${bars}
+      </svg>
+    </div>
+  `;
+}
+
+function renderLineChartSvg(data, options = {}) {
+  if (!data.length) {
+    return `<div class="chart-empty">No chart data yet.</div>`;
+  }
+  const width = 640;
+  const height = options.height || 320;
+  const padding = { top: 24, right: 20, bottom: 62, left: 20 };
+  const innerWidth = width - padding.left - padding.right;
+  const innerHeight = height - padding.top - padding.bottom;
+  const maxValue = Math.max(1, ...data.map((item) => item.value || 0));
+  const stepX = data.length === 1 ? 0 : innerWidth / (data.length - 1);
+  const points = data.map((item, index) => {
+    const x = padding.left + index * stepX;
+    const y = padding.top + innerHeight - ((item.value / maxValue) * innerHeight);
+    return { ...item, x, y };
+  });
+  const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`).join(" ");
+  const areaPath = `${linePath} L ${padding.left + innerWidth} ${padding.top + innerHeight} L ${padding.left} ${padding.top + innerHeight} Z`;
+  const pointNodes = points
+    .map((point) => `
+      <g class="chart-point-group">
+        <circle cx="${point.x}" cy="${point.y}" r="5" fill="${options.point || "#bd632f"}"></circle>
+        <text x="${point.x}" y="${height - 24}" text-anchor="middle" class="svg-axis-label">${point.label}</text>
+        <text x="${point.x}" y="${point.y - 12}" text-anchor="middle" class="svg-value-label">${point.meta}</text>
+      </g>
+    `)
+    .join("");
+  const gridLines = [0.2, 0.4, 0.6, 0.8, 1]
+    .map((step) => {
+      const y = padding.top + innerHeight - innerHeight * step;
+      return `<line x1="${padding.left}" y1="${y}" x2="${width - padding.right}" y2="${y}" class="svg-grid-line"></line>`;
+    })
+    .join("");
+  return `
+    <div class="chart-svg-wrap">
+      <svg viewBox="0 0 ${width} ${height}" class="chart-svg" role="img" aria-label="Hourly trend chart">
+        ${gridLines}
+        <path d="${areaPath}" fill="${options.fill || "rgba(74, 143, 134, 0.12)"}"></path>
+        <path d="${linePath}" fill="none" stroke="${options.stroke || "#4a8f86"}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
+        ${pointNodes}
+      </svg>
     </div>
   `;
 }
@@ -797,6 +1056,11 @@ async function updateRoomSensors(roomId, root) {
     }
   } catch (error) {
     document.getElementById("deviceMessage").textContent = error.message;
+  } finally {
+    root.querySelectorAll("[data-sensor-key]").forEach((input) => {
+      input.dataset.syncPending = "false";
+      input.dataset.userAdjusting = "false";
+    });
   }
 }
 
@@ -828,6 +1092,12 @@ async function applyDeviceControl(deviceId, level, options = {}) {
   } catch (error) {
     document.getElementById("deviceMessage").textContent = error.message;
     await refreshDashboard();
+  } finally {
+    const slider = document.querySelector(`[data-device-id="${deviceId}"][data-device-kind="light"], [data-device-id="${deviceId}"][data-device-kind="fan"]`);
+    if (slider) {
+      slider.dataset.syncPending = "false";
+      slider.dataset.userAdjusting = "false";
+    }
   }
 }
 
@@ -858,7 +1128,7 @@ function previewDeviceSlider(input) {
     return;
   }
   if (input.dataset.deviceKind === "light") {
-    const isOn = value > 0;
+    const isOn = input.closest(".room-card").querySelector(`[data-device-kind="light-toggle"]`)?.classList.contains("on") ?? (value > 0);
     const roomColor = getComputedStyle(card.root).getPropertyValue("--light-color").trim() || "#ffd36b";
     card.lightStatus.textContent = `${value}% brightness`;
     card.lightToggle.classList.toggle("on", isOn);
@@ -1007,6 +1277,7 @@ document.getElementById("houseGrid").addEventListener("input", (event) => {
   const input = event.target;
   if (input.dataset.sensorKey) {
     input.dataset.userAdjusting = "true";
+    input.dataset.syncPending = "true";
     input.parentElement.querySelector("strong").textContent = `${input.value}${input.dataset.sensorSuffix}`;
     previewMetricsForRoom(input.dataset.roomId, {
       [input.dataset.sensorKey]: Number(input.value),
@@ -1016,6 +1287,7 @@ document.getElementById("houseGrid").addEventListener("input", (event) => {
   }
   if (input.dataset.deviceKind) {
     input.dataset.userAdjusting = "true";
+    input.dataset.syncPending = "true";
     input.parentElement.querySelector("strong").textContent = `${input.value}${input.dataset.deviceSuffix}`;
     previewDeviceSlider(input);
     previewMetricsForRoom(input.dataset.roomId, input.dataset.deviceKind === "fan"
@@ -1040,7 +1312,6 @@ document.getElementById("houseGrid").addEventListener("input", (event) => {
 document.getElementById("houseGrid").addEventListener("change", async (event) => {
   const input = event.target;
   if (input.dataset.sensorKey) {
-    input.dataset.userAdjusting = "false";
     const existing = sensorSyncTimers.get(input.dataset.roomId);
     if (existing) {
       clearTimeout(existing);
@@ -1050,7 +1321,6 @@ document.getElementById("houseGrid").addEventListener("change", async (event) =>
     return;
   }
   if (input.dataset.deviceKind && !input.disabled) {
-    input.dataset.userAdjusting = "false";
     const existing = deviceSyncTimers.get(input.dataset.deviceId);
     if (existing) {
       clearTimeout(existing);
@@ -1101,5 +1371,34 @@ document.getElementById("dashboardRangeTabs").addEventListener("click", (event) 
   }
 });
 
+document.getElementById("dashboardRoomFilters").addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-room-filter]");
+  if (!tab) {
+    return;
+  }
+  dashboardRoomFilter = tab.dataset.roomFilter;
+  document.querySelectorAll("[data-room-filter]").forEach((node) => {
+    node.classList.toggle("active", node === tab);
+  });
+  if (latestSnapshot?.dashboard) {
+    renderDashboard(latestSnapshot.dashboard);
+  }
+});
+
+document.getElementById("dashboardMetricFilters").addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-metric-filter]");
+  if (!tab) {
+    return;
+  }
+  dashboardMetricFilter = tab.dataset.metricFilter;
+  document.querySelectorAll("[data-metric-filter]").forEach((node) => {
+    node.classList.toggle("active", node === tab);
+  });
+  if (latestSnapshot?.dashboard) {
+    renderDashboard(latestSnapshot.dashboard);
+  }
+});
+
 refreshDashboard();
 setInterval(advanceAutomation, 900);
+setInterval(tickLiveTokenMeters, 250);

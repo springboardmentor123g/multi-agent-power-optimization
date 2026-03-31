@@ -9,6 +9,7 @@ from control.fan_policy import (
     runtime_from_record,
 )
 from control.light_policy import (
+    LightControlState,
     LightPolicyConfig,
     evaluate_light_policy,
     runtime_from_record as light_runtime_from_record,
@@ -20,6 +21,10 @@ from home_layout import ROOMS, derive_occupancy_label, resolve_room_mode
 TARIFF_PER_KWH = 8.0
 DEFAULT_FAN_POLICY_CONFIG = FanPolicyConfig()
 DEFAULT_LIGHT_POLICY_CONFIG = LightPolicyConfig()
+POWER_TOKEN_SCALE = 1.42
+RATE_TOKEN_SCALE = 88.0
+SESSION_TOKEN_SCALE = 7.6
+BILLING_TOKEN_SCALE = 960.0
 
 
 def estimate_light_power(light, occupancy_count=0):
@@ -86,6 +91,39 @@ def calculate_metrics(room_sensors, appliances):
         "session_cost_inr": session_cost,
         "temperature_status": get_temperature_status(average_temp),
     }
+
+
+def current_power_tokens(power_watts):
+    return round(power_watts * POWER_TOKEN_SCALE, 1)
+
+
+def current_rate_tokens(hourly_cost_inr):
+    return round(hourly_cost_inr * RATE_TOKEN_SCALE, 1)
+
+
+def current_billing_rate_tokens(hourly_cost_inr):
+    return round(hourly_cost_inr * BILLING_TOKEN_SCALE, 1)
+
+
+def token_delta(power_watts, elapsed_hours):
+    return round(power_watts * elapsed_hours * SESSION_TOKEN_SCALE, 3)
+
+
+def attach_runtime_tokens(metrics, runtime_meter):
+    enriched = dict(metrics)
+    if runtime_meter:
+        enriched["power_tokens"] = round(runtime_meter["current_power_tokens"], 1)
+        enriched["rate_tokens"] = round(runtime_meter["current_rate_tokens"], 1)
+        enriched["session_tokens"] = round(runtime_meter["session_tokens"], 1)
+        enriched["billing_tokens"] = round(runtime_meter["billing_tokens"], 1)
+        enriched["daily_projection_tokens"] = round(runtime_meter["current_rate_tokens"] * 24, 1)
+    else:
+        enriched["power_tokens"] = current_power_tokens(metrics["active_power_watts"])
+        enriched["rate_tokens"] = current_billing_rate_tokens(metrics["hourly_cost_inr"])
+        enriched["session_tokens"] = round(metrics["active_power_watts"] * 0.18, 1)
+        enriched["billing_tokens"] = round(current_billing_rate_tokens(metrics["hourly_cost_inr"]) * 0.1, 1)
+        enriched["daily_projection_tokens"] = round(current_billing_rate_tokens(metrics["hourly_cost_inr"]) * 24, 1)
+    return enriched
 
 
 def build_room_metrics(room_id, sensors, appliances):
@@ -330,7 +368,11 @@ def evaluate_room(
         config=light_policy_config,
     )
     target_brightness = light_result.applied_brightness
-    desired_light_state = "OFF" if target_brightness == 0 else "ON"
+    light_preserve_on_zero = (
+        target_brightness == 0
+        and light_result.state != LightControlState.HOLD
+    )
+    desired_light_state = "ON" if light_preserve_on_zero or target_brightness > 0 else "OFF"
     if light["state"] != desired_light_state or int(light["level"]) != target_brightness:
         actions.append(
             {
@@ -338,6 +380,7 @@ def evaluate_room(
                 "appliance": light_id,
                 "action": desired_light_state,
                 "level": target_brightness,
+                "preserve_on_zero": light_preserve_on_zero,
                 "reason": light_result.explanation,
             }
         )

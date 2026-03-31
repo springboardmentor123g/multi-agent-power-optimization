@@ -303,6 +303,12 @@ button.full {
   gap: 16px;
 }
 
+.dashboard-filters {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
 .dashboard-summary {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   margin-bottom: 18px;
@@ -358,12 +364,64 @@ button.full {
   display: block;
   margin-top: 8px;
   font-size: 1.16rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .chart-stack,
 .recommendation-list {
   display: grid;
   gap: 12px;
+}
+
+.chart-svg-wrap {
+  width: 100%;
+  min-height: 320px;
+}
+
+.chart-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.svg-grid-line {
+  stroke: rgba(23, 33, 33, 0.1);
+  stroke-width: 1;
+}
+
+.svg-axis-label,
+.svg-value-label {
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.svg-axis-label {
+  fill: rgba(23, 33, 33, 0.58);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.svg-value-label {
+  fill: #172121;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.chart-bar-group rect {
+  filter: drop-shadow(0 10px 22px rgba(74, 143, 134, 0.18));
+}
+
+.chart-point-group circle {
+  filter: drop-shadow(0 6px 10px rgba(189, 99, 47, 0.28));
+}
+
+.chart-empty {
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  border: 1px dashed rgba(23, 33, 33, 0.16);
+  color: rgba(23, 33, 33, 0.58);
 }
 
 .chart-row {
@@ -376,6 +434,10 @@ button.full {
   align-items: baseline;
   justify-content: space-between;
   gap: 12px;
+}
+
+.chart-row-top strong {
+  font-variant-numeric: tabular-nums;
 }
 
 .chart-bar-track {
@@ -431,13 +493,19 @@ button.full {
 }
 
 .mic-button {
-  min-width: 78px;
-  padding: 10px 14px;
+  min-width: 42px;
+  width: 42px;
+  height: 42px;
+  padding: 0;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.84);
   color: var(--ink);
   border: 1px solid rgba(23, 33, 33, 0.12);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.35);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1rem;
 }
 
 .mic-button:hover {
@@ -455,6 +523,7 @@ button.full {
   display: block;
   margin-top: 8px;
   font-size: 1.18rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .house-grid {
@@ -685,6 +754,7 @@ button.full {
 
 .metric-pill strong {
   font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
 }
 
 .voice-note {
