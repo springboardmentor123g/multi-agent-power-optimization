@@ -68,6 +68,7 @@ class VoiceCommandParser:
     def _parse_with_openai(self, raw_text, active_room_id):
         payload = {
             "model": self.model,
+            "max_output_tokens": 120,
             "input": [
                 {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
                 {
@@ -75,14 +76,7 @@ class VoiceCommandParser:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": json.dumps(
-                                {
-                                    "active_room_id": active_room_id,
-                                    "allowed_rooms": ALLOWED_ROOMS,
-                                    "allowed_devices": ALLOWED_DEVICES,
-                                    "raw_text": raw_text,
-                                }
-                            ),
+                            "text": f"active_room_id={active_room_id}; devices=fan,light; raw_text={raw_text}",
                         }
                     ],
                 },
@@ -106,7 +100,7 @@ class VoiceCommandParser:
                 },
                 method="POST",
             ),
-            timeout=20,
+            timeout=5,
         )
         body = json.loads(response.read().decode("utf-8"))
         command_text = extract_output_text(body)
@@ -151,26 +145,46 @@ def fallback_parse(raw_text, active_room_id):
     if not device:
         return clarify_command(active_room_id, raw_text, "Device is not clear.")
 
+    absolute_value = extract_absolute_percent(text)
+    delta_value = extract_delta_percent(text)
     value = extract_percent(text)
     if "turn" in text and "off" in text:
         return build_command(f"turn_{device}_off", active_room_id, device, 0, raw_text, "Explicit off request.")
     if "turn" in text and "on" in text:
         return build_command(f"turn_{device}_on", active_room_id, device, None, raw_text, "Explicit on request.")
+    if absolute_value is not None and device == "fan":
+        return build_command(
+            "set_fan_speed",
+            active_room_id,
+            "fan",
+            clamp_percent(absolute_value),
+            raw_text,
+            "Absolute fan speed request.",
+        )
+    if absolute_value is not None and device == "light":
+        return build_command(
+            "set_light_brightness",
+            active_room_id,
+            "light",
+            clamp_percent(absolute_value),
+            raw_text,
+            "Absolute light brightness request.",
+        )
     if "increase" in text or "raise" in text or "up" in text:
         return build_command(
             f"increase_{device}_speed" if device == "fan" else "clarify",
             active_room_id,
             device if device == "fan" else None,
-            clamp_percent(value if value is not None else 10),
+            clamp_percent(delta_value if delta_value is not None else value if value is not None else 10),
             raw_text,
             "Increase request." if device == "fan" else "Light increase is unsupported.",
         )
-    if "decrease" in text or "lower" in text or "down" in text:
+    if "decrease" in text or "reduce" in text or "lower" in text or "down" in text:
         return build_command(
             f"decrease_{device}_speed" if device == "fan" else "clarify",
             active_room_id,
             device if device == "fan" else None,
-            clamp_percent(value if value is not None else 10),
+            clamp_percent(delta_value if delta_value is not None else value if value is not None else 10),
             raw_text,
             "Decrease request." if device == "fan" else "Light decrease is unsupported.",
         )
@@ -205,6 +219,26 @@ def detect_device(text):
 
 def extract_percent(text):
     match = re.search(r"(\d{1,3})", text)
+    if not match:
+        return None
+    return clamp_percent(int(match.group(1)))
+
+
+def extract_absolute_percent(text):
+    patterns = [
+        r"\b(?:to|at)\s+(\d{1,3})\s*(?:%|percent)?\b",
+        r"\bset\s+(?:the\s+)?(?:fan|light|lights|brightness)?\s*(?:speed\s*)?(?:to|at)?\s*(\d{1,3})\s*(?:%|percent)?\b",
+        r"\bmake\s+(?:it|the\s+(?:fan|light|lights))\s+(\d{1,3})\s*(?:%|percent)?\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return clamp_percent(int(match.group(1)))
+    return None
+
+
+def extract_delta_percent(text):
+    match = re.search(r"\bby\s+(\d{1,3})\s*(?:%|percent)?\b", text)
     if not match:
         return None
     return clamp_percent(int(match.group(1)))

@@ -60,45 +60,6 @@
       </div>
         <div id="houseGrid" class="house-grid"></div>
       </section>
-
-      <section class="grid two-up">
-        <article class="panel">
-          <p class="eyebrow">Action Layer</p>
-          <h2>Smart Assist</h2>
-          <p id="modeDescription" class="panel-copy">User changes apply immediately. Optimization and energy corrections continue in the background instead of forcing a visible mode switch.</p>
-          <button id="runDecisionButton" class="full">Run Evaluation Now</button>
-          <div id="deviceMessage" class="callout muted">Awaiting controller activity.</div>
-        </article>
-
-        <article class="panel">
-          <p class="eyebrow">Voice / LLM Layer</p>
-          <h2>Room-Local Voice Commands</h2>
-          <div class="status-list">
-            <div class="status-item"><span>Voice input</span><strong>Browser STT</strong></div>
-            <div class="status-item"><span>Command parsing</span><strong>Nano model -> strict JSON</strong></div>
-            <div class="status-item"><span>Execution</span><strong>Room-local only</strong></div>
-            <div class="status-item"><span>Fallback</span><strong>Deterministic parser</strong></div>
-          </div>
-        </article>
-
-        <article class="panel">
-          <p class="eyebrow">Analysis Layer</p>
-          <h2>Live Summary</h2>
-          <div class="status-list" id="analysisStatus"></div>
-          <h3>Energy Insights</h3>
-          <ul id="insightsList" class="list"></ul>
-        </article>
-
-        <article class="panel">
-          <p class="eyebrow">Decision Layer</p>
-          <h2>Automation Activity</h2>
-          <div id="activitySummary" class="callout">No recent automated adjustments.</div>
-          <details class="log-drawer">
-            <summary>Show decision log</summary>
-            <div id="decisionLog" class="log-list"></div>
-          </details>
-        </article>
-      </section>
     </section>
 
     <section id="dashboardView" class="view-panel">
@@ -114,13 +75,26 @@
           </div>
         </div>
         <div class="dashboard-summary" id="dashboardSummary"></div>
-        <div class="dashboard-filters">
-          <div class="range-toggle" id="dashboardRoomFilters">
-            <button class="range-chip active" type="button" data-room-filter="all">All rooms</button>
-            <button class="range-chip" type="button" data-room-filter="living_room">Living</button>
-            <button class="range-chip" type="button" data-room-filter="bedroom">Bedroom</button>
-            <button class="range-chip" type="button" data-room-filter="kitchen">Kitchen</button>
-            <button class="range-chip" type="button" data-room-filter="study">Study</button>
+        <div class="dashboard-toolbar">
+          <div class="dashboard-select-row">
+            <label class="dashboard-select-shell">
+              <span>Room</span>
+              <select id="dashboardRoomSelect" class="dashboard-select">
+                <option value="all">All rooms</option>
+                <option value="living_room">Living Room</option>
+                <option value="bedroom">Bedroom</option>
+                <option value="kitchen">Kitchen</option>
+                <option value="study">Study</option>
+              </select>
+            </label>
+            <label class="dashboard-select-shell">
+              <span>Trend</span>
+              <select id="dashboardTrendSelect" class="dashboard-select">
+                <option value="hourly">Hourly trend</option>
+                <option value="daily">Daily trend</option>
+                <option value="weekly">Weekly trend</option>
+              </select>
+            </label>
           </div>
           <div class="range-toggle" id="dashboardMetricFilters">
             <button class="range-chip active" type="button" data-metric-filter="cost">Cost</button>
@@ -140,8 +114,8 @@
           </article>
           <article class="dashboard-card">
             <div class="dashboard-card-head">
-              <h3>Hourly trend</h3>
-              <span class="subtle">Power and cost pattern</span>
+              <h3 id="trendChartTitle">Hourly trend</h3>
+              <span class="subtle" id="trendChartSubtitle">Power and cost pattern</span>
             </div>
             <div id="hourlyTrendChart" class="chart-stack"></div>
           </article>

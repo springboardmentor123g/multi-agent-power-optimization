@@ -15,6 +15,7 @@ from control.light_policy import (
     apply_manual_light_intent,
     describe_runtime as describe_light_runtime,
     release_hold_for_sensor_intent as release_light_hold_for_sensor_intent,
+    reset_runtime_for_auto_sync as reset_light_runtime_for_auto_sync,
     runtime_from_record as light_runtime_from_record,
     runtime_to_record as light_runtime_to_record,
 )
@@ -57,11 +58,15 @@ from device_controller import build_device_controller
 from home_layout import ROOM_MODE_OPTIONS, ROOMS, build_rooms_payload
 from voice.command_executor import build_execution_plan
 from voice.command_parser import VoiceCommandParser
+from voice.room_voice_assistant import RoomVoiceAssistant
+from voice.assist_executor import build_assist_execution_plan
 
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 device_controller = build_device_controller()
 voice_command_parser = VoiceCommandParser()
+room_voice_assistant = RoomVoiceAssistant()
+voice_assist_sessions = {}
 
 
 def build_snapshot():
@@ -198,6 +203,26 @@ def apply_room_mode_update(room_id, mode):
     snapshot = build_snapshot()
     snapshot["latest_actions"] = actions
     snapshot["device_message"] = f"{ROOMS[room_id]['name']} mode updated to {mode}."
+    return snapshot
+
+
+def apply_assist_plan(plan, acknowledgement):
+    if plan["kind"] == "noop":
+        snapshot = build_snapshot()
+        snapshot["device_message"] = plan["message"]
+        return snapshot
+    for operation in plan["operations"]:
+        if operation["type"] == "room_mode":
+            set_room_mode(operation["room_id"], operation["mode"])
+        elif operation["type"] == "device":
+            apply_appliance_update_internal(
+                operation["appliance"],
+                operation["level"],
+                resume=False,
+                preserve_on_zero=False,
+            )
+    snapshot = build_snapshot()
+    snapshot["device_message"] = acknowledgement
     return snapshot
 
 
@@ -423,6 +448,61 @@ def voice_command():
     return jsonify(snapshot)
 
 
+@app.route("/api/voice/assist/start", methods=["POST"])
+def voice_assist_start():
+    payload = request.get_json(force=True)
+    room_id = payload.get("room_id")
+    if room_id not in ROOMS:
+        return jsonify({"error": f"Unknown room: {room_id}"}), 400
+    room_snapshot = build_snapshot()["rooms"][room_id]
+    response, assist_debug = room_voice_assistant.start_with_debug(room_id, room_snapshot)
+    voice_assist_sessions[room_id] = {
+        "spoken_text": response["spoken_text"],
+        "summary": response["summary"],
+        "suggested_intent": response["suggested_intent"],
+    }
+    snapshot = build_snapshot()
+    snapshot["voice_assist"] = {
+        "room_id": room_id,
+        **response,
+        "awaiting_reply": True,
+    }
+    snapshot["voice_assist_debug"] = assist_debug
+    snapshot["device_message"] = response["spoken_text"]
+    return jsonify(snapshot)
+
+
+@app.route("/api/voice/assist/reply", methods=["POST"])
+def voice_assist_reply():
+    payload = request.get_json(force=True)
+    room_id = payload.get("room_id")
+    raw_text = str(payload.get("raw_text", "")).strip()
+    if room_id not in ROOMS:
+        return jsonify({"error": f"Unknown room: {room_id}"}), 400
+    session = voice_assist_sessions.get(room_id)
+    if not session:
+        return jsonify({"error": "No active voice-assist session for this room."}), 400
+    room_snapshot = build_snapshot()["rooms"][room_id]
+    response, assist_debug = room_voice_assistant.reply_with_debug(
+        room_id,
+        room_snapshot,
+        session["spoken_text"],
+        raw_text,
+    )
+    plan = build_assist_execution_plan(response, room_id)
+    snapshot = apply_assist_plan(plan, response["acknowledgement"])
+    snapshot["voice_assist"] = {
+        "room_id": room_id,
+        **response,
+        "awaiting_reply": False,
+        "user_reply": raw_text,
+    }
+    snapshot["voice_assist_debug"] = assist_debug
+    snapshot["device_message"] = response["acknowledgement"]
+    voice_assist_sessions.pop(room_id, None)
+    return jsonify(snapshot)
+
+
 @app.route("/api/decision/evaluate", methods=["POST"])
 def evaluate_decisions():
     actions = run_decision_cycle()
@@ -457,6 +537,14 @@ def run_decision_cycle(sync_snapshot=False):
                     runtime_from_record(fan_policy_states.get(room_id)),
                     raw_temp=float(room_sensors[room_id]["temperature"]),
                     raw_humidity=float(room_sensors[room_id].get("humidity", 55.0)),
+                )
+            )
+            for room_id in ROOMS
+        }
+        light_policy_states = {
+            room_id: light_runtime_to_record(
+                reset_light_runtime_for_auto_sync(
+                    light_runtime_from_record(light_policy_states.get(room_id))
                 )
             )
             for room_id in ROOMS

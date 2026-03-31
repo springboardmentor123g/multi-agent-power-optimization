@@ -321,7 +321,7 @@ class PowerOptimizationTestCase(unittest.TestCase):
             json={
                 "room_id": "bedroom",
                 "temperature": 25,
-                "ambient_light": 95,
+                "ambient_light": 100,
                 "occupancy_count": 0,
             },
         )
@@ -331,6 +331,25 @@ class PowerOptimizationTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(light["state"], "ON")
         self.assertEqual(light["brightness"], 0)
+
+    def test_system_state_keeps_low_light_level_for_vacant_dim_room(self):
+        self.client.post(
+            "/api/sensor-reading",
+            json={
+                "room_id": "living_room",
+                "temperature": 25,
+                "ambient_light": 45,
+                "occupancy_count": 0,
+            },
+        )
+
+        response = self.client.get("/api/system-state")
+        payload = response.get_json()
+        light = payload["rooms"]["living_room"]["devices"]["light"]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(light["state"], "ON")
+        self.assertGreater(light["brightness"], 0)
 
     def test_repeated_evaluations_keep_hot_room_speed_stable(self):
         response = self.client.post(
@@ -475,6 +494,37 @@ class PowerOptimizationTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertGreaterEqual(fan["speed_percent"], 90)
         self.assertEqual(fan["speed"], "HIGH")
+
+    def test_system_state_syncs_light_to_room_sensor_conditions(self):
+        self.client.post(
+            "/api/sensor-reading",
+            json={
+                "room_id": "bedroom",
+                "temperature": 25,
+                "ambient_light": 10,
+                "occupancy_count": 1,
+            },
+        )
+        self.client.post("/api/control/appliance", json={"appliance": "bedroom_light", "level": 12})
+
+        import database
+        from control.light_policy import runtime_from_record, runtime_to_record
+
+        runtime = runtime_from_record(database.get_light_policy_states()["bedroom"])
+        stale_hold = runtime.__class__(
+            hold_until_epoch=runtime.hold_until_epoch + 300,
+            user_brightness=12,
+            phase=runtime.phase,
+            last_reason=runtime.last_reason,
+        )
+        database.save_light_policy_state("bedroom", runtime_to_record(stale_hold))
+
+        response = self.client.get("/api/system-state")
+        payload = response.get_json()
+        light = payload["rooms"]["bedroom"]["devices"]["light"]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertGreaterEqual(light["brightness"], 70)
 
     def test_high_temperature_reload_syncs_even_when_room_is_vacant(self):
         self.client.post(
@@ -651,6 +701,33 @@ class PowerOptimizationTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(payload["voice_command"]["intent"], "turn_light_on")
         self.assertEqual(light["brightness"], 35)
+
+    def test_voice_assist_start_returns_single_question(self):
+        response = self.client.post(
+            "/api/voice/assist/start",
+            json={"room_id": "bedroom"},
+        )
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("voice_assist", payload)
+        self.assertEqual(payload["voice_assist"]["message_type"], "question")
+        self.assertTrue(payload["voice_assist"]["awaiting_reply"])
+        self.assertIn("?", payload["voice_assist"]["spoken_text"])
+
+    def test_voice_assist_reply_executes_and_ends_session(self):
+        self.client.post("/api/voice/assist/start", json={"room_id": "bedroom"})
+        response = self.client.post(
+            "/api/voice/assist/reply",
+            json={"room_id": "bedroom", "raw_text": "yes increase both"},
+        )
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("voice_assist", payload)
+        self.assertEqual(payload["voice_assist"]["message_type"], "command")
+        self.assertFalse(payload["voice_assist"]["awaiting_reply"])
+        self.assertIn("acknowledgement", payload["voice_assist"])
 
     def test_usage_history_returns_room_sensor_history(self):
         response = self.client.get("/api/usage/history")

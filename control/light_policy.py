@@ -147,9 +147,18 @@ def release_hold_for_sensor_intent(
     )
 
 
+def reset_runtime_for_auto_sync(runtime: LightPolicyRuntime) -> LightPolicyRuntime:
+    return LightPolicyRuntime(
+        hold_until_epoch=0,
+        user_brightness=None,
+        phase=LightControlState.ASSIST,
+        last_reason="Light state synchronized from current room sensors.",
+    )
+
+
 def recommended_brightness(occupancy_count: int, ambient_light: float, *, min_occupied_brightness: int = 12) -> int:
     if occupancy_count <= 0:
-        return 0
+        return interpolate_vacant_brightness(float(ambient_light))
     return interpolate_brightness(float(ambient_light), min_occupied_brightness=min_occupied_brightness)
 
 
@@ -160,6 +169,29 @@ def interpolate_brightness(ambient_light: float, *, min_occupied_brightness: int
         (45.0, 35),
         (75.0, 18),
         (100.0, max(8, min_occupied_brightness)),
+    ]
+    if ambient_light <= points[0][0]:
+        return points[0][1]
+    if ambient_light >= points[-1][0]:
+        return points[-1][1]
+    for index in range(1, len(points)):
+        left_x, left_y = points[index - 1]
+        right_x, right_y = points[index]
+        if ambient_light <= right_x:
+            span = right_x - left_x
+            progress = (ambient_light - left_x) / span
+            value = left_y + (right_y - left_y) * progress
+            return clamp_percent(round(value))
+    return 0
+
+
+def interpolate_vacant_brightness(ambient_light: float) -> int:
+    points = [
+        (0.0, 22),
+        (20.0, 18),
+        (45.0, 12),
+        (75.0, 6),
+        (100.0, 0),
     ]
     if ambient_light <= points[0][0]:
         return points[0][1]

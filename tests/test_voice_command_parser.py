@@ -16,6 +16,22 @@ class VoiceCommandParserTestCase(unittest.TestCase):
         self.assertEqual(command["device"], "fan")
         self.assertEqual(command["value_percent"], 64)
 
+    def test_room_local_fallback_treats_reduce_to_as_absolute(self):
+        command = self.parser.parse("Reduce the fan to 30 percent", "bedroom")
+
+        self.assertEqual(command["intent"], "set_fan_speed")
+        self.assertEqual(command["room_id"], "bedroom")
+        self.assertEqual(command["device"], "fan")
+        self.assertEqual(command["value_percent"], 30)
+
+    def test_room_local_fallback_treats_reduce_by_as_relative(self):
+        command = self.parser.parse("Reduce the fan by 15 percent", "bedroom")
+
+        self.assertEqual(command["intent"], "decrease_fan_speed")
+        self.assertEqual(command["room_id"], "bedroom")
+        self.assertEqual(command["device"], "fan")
+        self.assertEqual(command["value_percent"], 15)
+
     def test_room_local_fallback_rejects_cross_room_requests(self):
         command = self.parser.parse("Turn on the kitchen light", "bedroom")
 

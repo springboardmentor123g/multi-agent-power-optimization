@@ -5,7 +5,8 @@ from control.light_policy import recommended_brightness
 
 class LightPolicyTestCase(unittest.TestCase):
     def test_recommended_brightness_is_zero_without_occupancy(self):
-        self.assertEqual(recommended_brightness(0, 10), 0)
+        self.assertEqual(recommended_brightness(0, 100), 0)
+        self.assertGreater(recommended_brightness(0, 10), 0)
 
     def test_recommended_brightness_changes_continuously_with_ambient_light(self):
         values = [
@@ -20,6 +21,9 @@ class LightPolicyTestCase(unittest.TestCase):
 
     def test_recommended_brightness_keeps_nonzero_floor_when_occupied(self):
         self.assertEqual(recommended_brightness(1, 100), 12)
+
+    def test_recommended_brightness_keeps_low_idle_light_when_vacant_and_dim(self):
+        self.assertEqual(recommended_brightness(0, 45), 12)
 
 
 if __name__ == "__main__":

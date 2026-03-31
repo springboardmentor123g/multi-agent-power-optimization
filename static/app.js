@@ -1,22 +1,29 @@
 const roomElements = new Map();
 const sensorSyncTimers = new Map();
 const deviceSyncTimers = new Map();
+const pendingOccupancy = new Map();
 const sliderAnimations = new Map();
 const metricAnimations = new Map();
 const roomVoiceFeedback = new Map();
 const roomVoiceDebug = new Map();
+const roomVoiceAssist = new Map();
 const latestRooms = new Map();
 let latestSnapshotRequestId = 0;
 let latestAppliedSnapshotId = 0;
 let activeRecognition = null;
 let activeListeningRoomId = null;
+let activeAssistListeningRoomId = null;
+let activeCommandProcessingRoomId = null;
 let latestSnapshot = null;
 let latestSnapshotRenderedAt = 0;
 let dashboardRange = "today";
 let dashboardRoomFilter = "all";
 let dashboardMetricFilter = "cost";
+let dashboardTrendWindow = "hourly";
 const UI_POWER_TOKEN_SCALE = 1.42;
 const UI_BILLING_RATE_TOKEN_SCALE = 960;
+const MAX_OCCUPANCY = 8;
+const VOICE_ASSIST_REPLY_TIMEOUT_MS = 12000;
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 function voiceLog(event, payload = {}) {
@@ -25,6 +32,29 @@ function voiceLog(event, payload = {}) {
 
 function voiceError(event, payload = {}) {
   console.error(`[smart-home][voice] ${event}`, payload);
+}
+
+function assistState(roomId) {
+  return roomVoiceAssist.get(roomId)?.ui_state || "idle";
+}
+
+function setAssistState(roomId, nextState) {
+  const current = roomVoiceAssist.get(roomId) || {};
+  roomVoiceAssist.set(roomId, { ...current, ...nextState });
+}
+
+function setNodeText(id, value) {
+  const node = document.getElementById(id);
+  if (node) {
+    node.textContent = value;
+  }
+}
+
+function setNodeHTML(id, value) {
+  const node = document.getElementById(id);
+  if (node) {
+    node.innerHTML = value;
+  }
 }
 
 async function fetchJSON(url, options = {}) {
@@ -57,6 +87,12 @@ async function requestSnapshot(url, options = {}) {
   return snapshot;
 }
 
+async function requestInteractiveSnapshot(url, options = {}) {
+  const snapshot = await fetchJSON(url, options);
+  latestAppliedSnapshotId = Math.max(latestAppliedSnapshotId, latestSnapshotRequestId);
+  return snapshot;
+}
+
 function renderSnapshot(snapshot) {
   latestSnapshot = snapshot;
   latestSnapshotRenderedAt = performance.now();
@@ -64,33 +100,42 @@ function renderSnapshot(snapshot) {
   document.getElementById("deviceMode").textContent = `Mode: ${snapshot.device_mode} · ${snapshot.deployment_model}`;
   renderGlobalMetrics(snapshot.metrics);
 
-  document.getElementById("analysisStatus").innerHTML = [
-    statusRow("Temperature", snapshot.metrics.temperature_status),
-    statusRow("Occupied rooms", countOccupiedRooms(snapshot.rooms)),
-    statusRow("Recent activity", snapshot.activity_summary),
-  ].join("");
+  setNodeHTML(
+    "analysisStatus",
+    [
+      statusRow("Temperature", snapshot.metrics.temperature_status),
+      statusRow("Occupied rooms", countOccupiedRooms(snapshot.rooms)),
+      statusRow("Recent activity", snapshot.activity_summary),
+    ].join("")
+  );
 
-  document.getElementById("insightsList").innerHTML = snapshot.insights
-    .map((insight) => `<li>${insight}</li>`)
-    .join("");
+  setNodeHTML(
+    "insightsList",
+    snapshot.insights.map((insight) => `<li>${insight}</li>`).join("")
+  );
 
-  document.getElementById("activitySummary").textContent = snapshot.activity_summary;
-  document.getElementById("decisionLog").innerHTML = snapshot.recent_decisions.length
-    ? snapshot.recent_decisions
-        .map(
-          (entry) => `
-            <div class="log-item">
-              <small>${entry.created_at} · ${entry.room_id} · ${entry.source}</small>
-              <strong>${entry.appliance} → ${entry.action}</strong>
-              <div>${entry.reason}</div>
-            </div>
-          `
-        )
-        .join("")
-    : `<div class="log-item"><strong>No decision logs yet.</strong></div>`;
+  setNodeText("activitySummary", snapshot.activity_summary);
+  setNodeHTML(
+    "decisionLog",
+    snapshot.recent_decisions.length
+      ? snapshot.recent_decisions
+          .map(
+            (entry) => `
+              <div class="log-item">
+                <small>${entry.created_at} · ${entry.room_id} · ${entry.source}</small>
+                <strong>${entry.appliance} → ${entry.action}</strong>
+                <div>${entry.reason}</div>
+              </div>
+            `
+          )
+          .join("")
+      : `<div class="log-item"><strong>No decision logs yet.</strong></div>`
+  );
 
-  document.getElementById("deviceMessage").textContent =
-    snapshot.device_message || "Simulation mode active. Room-local state synced.";
+  setNodeText(
+    "deviceMessage",
+    snapshot.device_message || "Simulation mode active. Room-local state synced."
+  );
 
   renderRooms(snapshot.rooms);
   renderDashboard(snapshot.dashboard);
@@ -119,13 +164,24 @@ function countOccupiedRooms(rooms) {
 function renderRooms(rooms) {
   const container = document.getElementById("houseGrid");
   Object.values(rooms).forEach((room) => {
+    const pendingCount = pendingOccupancy.get(room.id);
+    const roomForRender = pendingCount === undefined
+      ? room
+      : {
+          ...room,
+          sensors: {
+            ...room.sensors,
+            occupancy_count: pendingCount,
+            occupancy_level: formatOccupancyLevel(pendingCount),
+          },
+        };
     latestRooms.set(room.id, room);
     if (!roomElements.has(room.id)) {
-      const card = buildRoomCard(room);
+      const card = buildRoomCard(roomForRender);
       roomElements.set(room.id, card);
       container.append(card.root);
     }
-    updateRoomCard(roomElements.get(room.id), room);
+    updateRoomCard(roomElements.get(room.id), roomForRender);
   });
 }
 
@@ -140,6 +196,7 @@ function buildRoomCard(room) {
       </div>
       <div class="room-actions">
         <span class="room-badge" id="room-badge-${room.id}"></span>
+        <button class="mic-button speaker-button" type="button" data-room-id="${room.id}" data-voice-kind="speaker" id="voice-speaker-${room.id}" aria-label="Start voice assist for ${room.name}">🔊</button>
         <button class="mic-button" type="button" data-room-id="${room.id}" data-voice-kind="mic" id="voice-mic-${room.id}" aria-label="Speak a command for ${room.name}">🎙</button>
         <details class="sensor-popover" id="sensor-popover-${room.id}">
           <summary class="sensor-chip">Sensors</summary>
@@ -228,6 +285,7 @@ function buildRoomCard(room) {
     voiceStatus: root.querySelector(`#voice-status-${room.id}`),
     voiceDebug: root.querySelector(`#voice-debug-${room.id}`),
     sensorPopover: root.querySelector(`#sensor-popover-${room.id}`),
+    speakerButton: root.querySelector(`#voice-speaker-${room.id}`),
     micButton: root.querySelector(`#voice-mic-${room.id}`),
     fanRotor: root.querySelector(`#fan-rotor-${room.id}`),
     lightStatus: root.querySelector(`#light-status-${room.id}`),
@@ -238,6 +296,8 @@ function buildRoomCard(room) {
     roomPower: root.querySelector(`#room-power-${room.id}`),
     roomCost: root.querySelector(`#room-cost-${room.id}`),
     leds: [...root.querySelectorAll(`[id^="room-led-${room.id}-"]`)],
+    occupancyDown: root.querySelector(`[data-room-id="${room.id}"][data-occupancy-step="-1"]`),
+    occupancyUp: root.querySelector(`[data-room-id="${room.id}"][data-occupancy-step="1"]`),
   };
 }
 
@@ -279,14 +339,36 @@ function updateRoomCard(card, room) {
   const fanModeLabel = formatPolicyState(fanPolicy.state);
   const voiceFeedback = roomVoiceFeedback.get(room.id) || "Tap mic and speak for this room.";
   const voiceDebug = roomVoiceDebug.get(room.id) || "No voice activity yet.";
+  const speakerState = assistState(room.id);
 
   card.name.textContent = room.name;
   card.badge.textContent = lightOn || fanSwitchOn ? "Live" : "Idle";
   card.voiceStatus.textContent = voiceFeedback;
   card.voiceDebug.textContent = voiceDebug;
+  card.speakerButton.classList.toggle(
+    "listening",
+    speakerState === "awaiting_reply" || speakerState === "capturing_reply"
+  );
+  card.speakerButton.classList.toggle(
+    "processing",
+    speakerState === "loading" || speakerState === "replying"
+  );
   card.micButton.classList.toggle("listening", activeListeningRoomId === room.id);
+  card.micButton.classList.toggle("processing", activeCommandProcessingRoomId === room.id);
+  card.speakerButton.disabled = false;
   card.micButton.disabled = !SpeechRecognition;
-  card.micButton.textContent = activeListeningRoomId === room.id ? "◉" : "🎙";
+  card.micButton.textContent =
+    activeCommandProcessingRoomId === room.id
+      ? "…"
+      : activeListeningRoomId === room.id
+        ? "◉"
+        : "🎙";
+  card.speakerButton.textContent =
+    speakerState === "loading" || speakerState === "replying"
+      ? "…"
+      : speakerState === "awaiting_reply" || speakerState === "capturing_reply"
+        ? "◉"
+        : "🔊";
   card.root.classList.toggle("light-on", lightOn);
   card.root.style.setProperty("--light-color", light.color);
   card.root.style.setProperty("--room-glow", glow);
@@ -303,6 +385,12 @@ function updateRoomCard(card, room) {
   const occupancyStepper = card.root.querySelector(`#occupancy-stepper-${room.id}`);
   if (occupancyStepper) {
     occupancyStepper.textContent = String(room.sensors.occupancy_count);
+  }
+  if (card.occupancyDown) {
+    card.occupancyDown.disabled = Number(room.sensors.occupancy_count) <= 0;
+  }
+  if (card.occupancyUp) {
+    card.occupancyUp.disabled = Number(room.sensors.occupancy_count) >= MAX_OCCUPANCY;
   }
   animateMetricValue(card.roomPower, Number(room.metrics.power_tokens || 0), { suffix: " tok", decimals: 0 });
   primeLiveMeter(card.roomCost, Number(room.metrics.billing_tokens || 0), Number(room.metrics.rate_tokens || 0), " tok");
@@ -551,23 +639,40 @@ function recommendedFanStartupLevel(room) {
     return Math.round(policyTarget);
   }
   const temperature = Number(room.sensors.temperature || 0);
-  if (temperature >= 40) return 95;
-  if (temperature >= 36) return 82;
-  if (temperature >= 32) return 64;
-  if (temperature >= 28) return 42;
-  return 25;
+  const occupancy = Number(room.sensors.occupancy_count || 0);
+  if (occupancy <= 0) {
+    if (temperature >= 38) return 84;
+    if (temperature >= 34) return 58;
+    if (temperature >= 30) return 28;
+    if (temperature >= 22) return 18;
+    return 0;
+  }
+  const peopleBoost = Math.max(0, occupancy - 1) * 4;
+  if (temperature >= 40) return Math.min(100, 95 + peopleBoost);
+  if (temperature >= 36) return Math.min(100, 82 + peopleBoost);
+  if (temperature >= 32) return Math.min(96, 64 + peopleBoost);
+  if (temperature >= 28) return Math.min(88, 42 + peopleBoost);
+  return Math.max(22, 22 + peopleBoost);
 }
 
 function recommendedLightStartupLevel(room) {
   const occupancy = Number(room.sensors.occupancy_count || 0);
   const ambientLight = Number(room.sensors.ambient_light || 0);
-  if (occupancy <= 0) return 0;
-  const points = [
-    [0, 85],
-    [20, 65],
-    [45, 35],
-    [75, 0],
-  ];
+  const points = occupancy <= 0
+    ? [
+        [0, 22],
+        [20, 18],
+        [45, 12],
+        [75, 6],
+        [100, 0],
+      ]
+    : [
+        [0, 85],
+        [20, 65],
+        [45, 35],
+        [75, 18],
+        [100, 12],
+      ];
   if (ambientLight <= points[0][0]) return points[0][1];
   if (ambientLight >= points[points.length - 1][0]) return points[points.length - 1][1];
   for (let index = 1; index < points.length; index += 1) {
@@ -731,31 +836,31 @@ function previewMetricsForRoom(roomId, overrides = {}) {
     targetRoom.devices.fan.speed_percent = Number(overrides.fan_speed_percent);
     targetRoom.devices.fan.state = overrides.fan_state || targetRoom.devices.fan.state;
   }
-  const sensorDrivenPreview = (
+  const fanSensorPreview = (
     overrides.temperature !== undefined
-    || overrides.ambient_light !== undefined
     || overrides.occupancy_count !== undefined
   );
-  if (sensorDrivenPreview) {
-    const fanHeld = targetRoom.devices.fan.policy?.state === "hold";
-    const lightHeld = targetRoom.devices.light.policy?.state === "hold";
-    if (!fanHeld) {
-      const predictedFan = recommendedFanStartupLevel(targetRoom);
-      targetRoom.devices.fan.speed_percent = predictedFan;
-      targetRoom.devices.fan.state = "ON";
-      const card = roomElements.get(roomId);
-      if (card) {
-        applyFanVisualPreview(card, predictedFan, true);
-      }
+  const lightSensorPreview = (
+    overrides.ambient_light !== undefined
+    || overrides.occupancy_count !== undefined
+  );
+  const fanHeld = targetRoom.devices.fan.policy?.state === "hold";
+  const lightHeld = targetRoom.devices.light.policy?.state === "hold";
+  const card = roomElements.get(roomId);
+  if (fanSensorPreview && !fanHeld) {
+    const predictedFan = recommendedFanStartupLevel(targetRoom);
+    targetRoom.devices.fan.speed_percent = predictedFan;
+    targetRoom.devices.fan.state = "ON";
+    if (card) {
+      applyFanVisualPreview(card, predictedFan, true);
     }
-    if (!lightHeld) {
-      const predictedLight = recommendedLightStartupLevel(targetRoom);
-      targetRoom.devices.light.brightness = predictedLight;
-      targetRoom.devices.light.state = predictedLight > 0 ? "ON" : "OFF";
-      const card = roomElements.get(roomId);
-      if (card) {
-        applyLightVisualPreview(card, predictedLight, predictedLight > 0);
-      }
+  }
+  if (lightSensorPreview && !lightHeld) {
+    const predictedLight = recommendedLightStartupLevel(targetRoom);
+    targetRoom.devices.light.brightness = predictedLight;
+    targetRoom.devices.light.state = predictedLight > 0 ? "ON" : "ON";
+    if (card) {
+      applyLightVisualPreview(card, predictedLight, true);
     }
   }
   const { roomMetrics, globalMetrics } = calculateSnapshotMetricsForUI(projectedRooms, tariff);
@@ -816,6 +921,8 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
     }))
     .sort((left, right) => right.cost_inr - left.cost_inr);
   const peak = comparison[0] || { name: "Living Room" };
+  const totalBase = Number(globalMetrics.rate_tokens || 0);
+  const activeBase = Number(globalMetrics.power_tokens || 0);
   return {
     summary: {
       total_energy_today_kwh: Number(((globalMetrics.power_tokens * 4.2) / 1000).toFixed(2)),
@@ -826,12 +933,11 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
       savings_opportunity_percent: Number(Math.min(26, Math.max(8, globalMetrics.rate_tokens * 0.1)).toFixed(1)),
     },
     room_comparison: comparison,
-    hourly_trend: comparison.slice(0, 4).map((item, index) => ({
-      hour: ["09:00", "13:00", "18:00", "21:00"][index] || "Now",
-      power_watts: Number((item.energy_kwh * 220).toFixed(1)),
-      cost_inr: Number((item.cost_inr / 4.2).toFixed(2)),
-      activity: item.occupancy_score,
-    })),
+    trends: {
+      hourly: buildTrendSeries("hourly", comparison, totalBase, activeBase),
+      daily: buildTrendSeries("daily", comparison, totalBase, activeBase),
+      weekly: buildTrendSeries("weekly", comparison, totalBase, activeBase),
+    },
     recommendations: [
       `${peak.name} is leading current demand. A 10-15% trim would show the biggest savings.`,
       "This live preview updates as you move fan, light, and occupancy controls.",
@@ -843,6 +949,73 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
   };
 }
 
+function buildTrendSeries(window, comparison, totalRateTokens, totalPowerTokens) {
+  const topRooms = comparison.slice(0, 3);
+  const roomWeight = topRooms.length
+    ? topRooms.reduce((sum, item) => sum + item.occupancy_score + (item.avg_fan_percent / 50) + (item.avg_light_percent / 60), 0) / topRooms.length
+    : 1;
+  const baseRate = Math.max(40, totalRateTokens || 40);
+  const basePower = Math.max(30, totalPowerTokens || 30);
+  const shapes = {
+    hourly: {
+      labels: ["06:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"],
+      multipliers: [0.42, 0.68, 0.58, 0.74, 1.0, 0.88, 0.54],
+      subtitle: "Live room behavior across the day",
+    },
+    daily: {
+      labels: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+      multipliers: [0.76, 0.82, 0.78, 0.9, 0.96, 1.08, 0.88],
+      subtitle: "Daily load and billing progression",
+    },
+    weekly: {
+      labels: ["W1", "W2", "W3", "W4", "W5", "W6"],
+      multipliers: [0.82, 0.86, 0.92, 0.98, 1.06, 1.02],
+      subtitle: "Weekly optimization and usage drift",
+    },
+  };
+  const selected = shapes[window] || shapes.hourly;
+  const points = selected.labels.map((label, index) => {
+    const load = selected.multipliers[index] * (0.9 + roomWeight * 0.05);
+    const value = Number((baseRate * load).toFixed(1));
+    return {
+      label,
+      value,
+      rate_tokens: value,
+      power_tokens: Number((basePower * load).toFixed(1)),
+      activity: Number((roomWeight * selected.multipliers[index] * 2.2).toFixed(1)),
+    };
+  });
+  const peakPoint = points.reduce((peak, point) => (point.value > peak.value ? point : peak), points[0]);
+  return {
+    window,
+    subtitle: selected.subtitle,
+    points,
+    peak_label: peakPoint.label,
+  };
+}
+
+function normalizeDashboardPayload(dashboard) {
+  const fallbackComparison = Array.isArray(dashboard?.room_comparison) ? dashboard.room_comparison : [];
+  const summary = dashboard?.summary || {};
+  const inferredRate = Number(summary.total_cost_today_inr || 0) * 2 || 60;
+  const inferredPower = Number(summary.total_energy_today_kwh || 0) * 240 || 90;
+  const trends = dashboard?.trends
+    ? dashboard.trends
+    : {
+        hourly: buildTrendSeries("hourly", fallbackComparison, inferredRate, inferredPower),
+        daily: buildTrendSeries("daily", fallbackComparison, inferredRate, inferredPower),
+        weekly: buildTrendSeries("weekly", fallbackComparison, inferredRate, inferredPower),
+      };
+  return {
+    summary,
+    room_comparison: fallbackComparison,
+    recommendations: dashboard?.recommendations || [],
+    inefficiencies: dashboard?.inefficiencies || [],
+    policy_preview: dashboard?.policy_preview || [],
+    trends,
+  };
+}
+
 function scaleDashboardValue(value) {
   return dashboardRange === "week" ? value * 7 : value;
 }
@@ -851,9 +1024,12 @@ function renderDashboard(dashboard) {
   if (!dashboard) {
     return;
   }
-  const roomComparison = (dashboard.room_comparison || []).filter((item) => (
+  const normalizedDashboard = normalizeDashboardPayload(dashboard);
+  const roomComparisonSource = normalizedDashboard.room_comparison || [];
+  const filteredRoomComparison = roomComparisonSource.filter((item) => (
     dashboardRoomFilter === "all" ? true : item.room_id === dashboardRoomFilter
   ));
+  const roomComparison = filteredRoomComparison.length ? filteredRoomComparison : roomComparisonSource;
   const metricAccessor = {
     cost: (item) => ({ value: item.cost_inr, label: `${scaleDashboardValue(item.cost_inr).toFixed(2)} bill tok` }),
     energy: (item) => ({ value: item.energy_kwh, label: `${scaleDashboardValue(item.energy_kwh).toFixed(2)} energy tok` }),
@@ -861,7 +1037,13 @@ function renderDashboard(dashboard) {
     light: (item) => ({ value: item.avg_light_percent, label: `${item.avg_light_percent.toFixed(0)}% avg light` }),
     occupancy: (item) => ({ value: item.occupancy_score, label: `${item.occupancy_score.toFixed(1)} persons` }),
   }[dashboardMetricFilter];
-  const summary = dashboard.summary || {};
+  const summary = normalizedDashboard.summary || {};
+  const trendSeries = normalizedDashboard.trends?.[dashboardTrendWindow] || normalizedDashboard.trends?.hourly || { points: [], subtitle: "" };
+  const trendLabel = {
+    hourly: "Hourly trend",
+    daily: "Daily trend",
+    weekly: "Weekly trend",
+  }[dashboardTrendWindow] || "Trend";
   document.getElementById("dashboardSummary").innerHTML = [
     summaryCard("Energy tokens", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0)).toFixed(2)} tok`),
     summaryCard("Bill tokens", `${scaleDashboardValue(Number(summary.total_cost_today_inr || 0)).toFixed(2)} tok`),
@@ -884,20 +1066,22 @@ function renderDashboard(dashboard) {
   });
 
   const trendMetricValue = {
-    cost: (item) => ({ value: item.cost_inr, label: `${scaleDashboardValue(item.cost_inr).toFixed(2)} bill tok` }),
-    energy: (item) => ({ value: item.power_watts, label: `${item.power_watts.toFixed(0)} power tok` }),
-    fan: (item) => ({ value: item.activity * 12, label: `${item.activity} activity` }),
-    light: (item) => ({ value: item.activity * 9, label: `${item.activity} lighting load` }),
-    occupancy: (item) => ({ value: item.activity, label: `${item.activity} activity` }),
+    cost: (item) => ({ value: scaleDashboardValue(item.rate_tokens), label: `${scaleDashboardValue(item.rate_tokens).toFixed(0)} bill tok/hr` }),
+    energy: (item) => ({ value: scaleDashboardValue(item.power_tokens), label: `${scaleDashboardValue(item.power_tokens).toFixed(0)} power tok` }),
+    fan: (item) => ({ value: item.activity * 18, label: `${Math.round(item.activity * 12)} fan load` }),
+    light: (item) => ({ value: item.activity * 15, label: `${Math.round(item.activity * 10)} light load` }),
+    occupancy: (item) => ({ value: item.activity, label: `${item.activity.toFixed(1)} activity` }),
   }[dashboardMetricFilter];
-  const trendChartData = dashboard.hourly_trend.map((item) => {
+  const trendChartData = trendSeries.points.map((item) => {
     const metric = trendMetricValue(item);
     return {
-      label: item.hour,
+      label: item.label,
       value: metric.value,
       meta: metric.label,
     };
   });
+  document.getElementById("trendChartTitle").textContent = trendLabel;
+  document.getElementById("trendChartSubtitle").textContent = `${trendSeries.subtitle || "Adaptive room behavior"} · Peak ${trendSeries.peak_label || "N/A"}`;
   document.getElementById("hourlyTrendChart").innerHTML = renderLineChartSvg(trendChartData, {
     height: 320,
     stroke: "#4a8f86",
@@ -905,16 +1089,41 @@ function renderDashboard(dashboard) {
     point: "#bd632f",
   });
 
+  const selectedRoom = roomComparison[0]?.name || summary.highest_consuming_room || "Selected room";
+  const adaptiveRecommendations = buildAdaptiveRecommendations({
+    dashboard: normalizedDashboard,
+    trendSeries,
+    selectedRoom,
+  });
   document.getElementById("recommendationsPanel").innerHTML = [
-    ...(dashboard.recommendations || []),
-    ...(dashboard.policy_preview || []),
+    ...adaptiveRecommendations,
+    ...(normalizedDashboard.policy_preview || []),
   ]
     .map((item) => `<div class="recommendation-item">${item}</div>`)
     .join("");
 
-  document.getElementById("inefficiencyPanel").innerHTML = (dashboard.inefficiencies || [])
+  document.getElementById("inefficiencyPanel").innerHTML = (normalizedDashboard.inefficiencies || [])
     .map((item) => `<div class="recommendation-item">${item}</div>`)
     .join("");
+}
+
+function buildAdaptiveRecommendations({ dashboard, trendSeries, selectedRoom }) {
+  const points = trendSeries.points || [];
+  if (!points.length) {
+    return dashboard.recommendations || [];
+  }
+  const peakPoint = points.reduce((peak, point) => (point.value > peak.value ? point : peak), points[0]);
+  const lowPoint = points.reduce((low, point) => (point.value < low.value ? point : low), points[0]);
+  const windowLabel = {
+    hourly: "today",
+    daily: "this week",
+    weekly: "this cycle",
+  }[dashboardTrendWindow] || "the current trend";
+  return [
+    `${selectedRoom} is projected to peak around ${peakPoint.label} for ${windowLabel}.`,
+    `${selectedRoom} has a softer demand window near ${lowPoint.label}; that is the best time to trim light or fan output.`,
+    `Optimization leverage is currently highest in ${dashboard.summary?.highest_consuming_room || selectedRoom}.`,
+  ];
 }
 
 function summaryCard(label, value) {
@@ -985,7 +1194,7 @@ function renderLineChartSvg(data, options = {}) {
     const y = padding.top + innerHeight - ((item.value / maxValue) * innerHeight);
     return { ...item, x, y };
   });
-  const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`).join(" ");
+  const linePath = buildSmoothPath(points);
   const areaPath = `${linePath} L ${padding.left + innerWidth} ${padding.top + innerHeight} L ${padding.left} ${padding.top + innerHeight} Z`;
   const pointNodes = points
     .map((point) => `
@@ -1014,6 +1223,23 @@ function renderLineChartSvg(data, options = {}) {
   `;
 }
 
+function buildSmoothPath(points) {
+  if (!points.length) {
+    return "";
+  }
+  if (points.length === 1) {
+    return `M ${points[0].x} ${points[0].y}`;
+  }
+  let path = `M ${points[0].x} ${points[0].y}`;
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const current = points[index];
+    const next = points[index + 1];
+    const controlX = (current.x + next.x) / 2;
+    path += ` C ${controlX} ${current.y}, ${controlX} ${next.y}, ${next.x} ${next.y}`;
+  }
+  return path;
+}
+
 async function refreshDashboard() {
   try {
     const snapshot = await requestSnapshot("/api/system-state");
@@ -1021,7 +1247,7 @@ async function refreshDashboard() {
       renderSnapshot(snapshot);
     }
   } catch (error) {
-    document.getElementById("deviceMessage").textContent = `Failed to load system state: ${error.message}`;
+    setNodeText("deviceMessage", `Failed to load system state: ${error.message}`);
   }
 }
 
@@ -1034,7 +1260,7 @@ async function advanceAutomation() {
       renderSnapshot(snapshot);
     }
   } catch (error) {
-    document.getElementById("deviceMessage").textContent = `Automation refresh failed: ${error.message}`;
+    setNodeText("deviceMessage", `Automation refresh failed: ${error.message}`);
   }
 }
 
@@ -1052,10 +1278,11 @@ async function updateRoomSensors(roomId, root) {
       body: JSON.stringify(payload),
     });
     if (snapshot) {
+      pendingOccupancy.delete(roomId);
       renderSnapshot(snapshot);
     }
   } catch (error) {
-    document.getElementById("deviceMessage").textContent = error.message;
+    setNodeText("deviceMessage", error.message);
   } finally {
     root.querySelectorAll("[data-sensor-key]").forEach((input) => {
       input.dataset.syncPending = "false";
@@ -1090,7 +1317,7 @@ async function applyDeviceControl(deviceId, level, options = {}) {
       renderSnapshot(snapshot);
     }
   } catch (error) {
-    document.getElementById("deviceMessage").textContent = error.message;
+    setNodeText("deviceMessage", error.message);
     await refreshDashboard();
   } finally {
     const slider = document.querySelector(`[data-device-id="${deviceId}"][data-device-kind="light"], [data-device-id="${deviceId}"][data-device-kind="fan"]`);
@@ -1147,61 +1374,294 @@ function paintVoiceStatus(roomId) {
   if (!card) {
     return;
   }
+  const speakerState = assistState(roomId);
   card.voiceStatus.textContent =
     roomVoiceFeedback.get(roomId) || "Tap mic and speak for this room.";
   card.voiceDebug.textContent =
     roomVoiceDebug.get(roomId) || "No voice activity yet.";
+  card.speakerButton.classList.toggle(
+    "listening",
+    speakerState === "awaiting_reply" || speakerState === "capturing_reply"
+  );
+  card.speakerButton.classList.toggle(
+    "processing",
+    speakerState === "loading" || speakerState === "replying"
+  );
   card.micButton.classList.toggle("listening", activeListeningRoomId === roomId);
-  card.micButton.textContent = activeListeningRoomId === roomId ? "Listening" : "Mic";
+  card.micButton.classList.toggle("processing", activeCommandProcessingRoomId === roomId);
+  card.micButton.textContent =
+    activeCommandProcessingRoomId === roomId
+      ? "…"
+      : activeListeningRoomId === roomId
+        ? "◉"
+        : "🎙";
+  card.speakerButton.textContent =
+    speakerState === "loading" || speakerState === "replying"
+      ? "…"
+      : speakerState === "awaiting_reply" || speakerState === "capturing_reply"
+        ? "◉"
+        : "🔊";
 }
 
 async function submitVoiceCommand(roomId, rawText) {
+  const startedAt = performance.now();
+  activeCommandProcessingRoomId = roomId;
   roomVoiceFeedback.set(roomId, `Heard: "${rawText}"`);
-  roomVoiceDebug.set(roomId, `transcript: ${rawText}\nstatus: sending to backend`);
+  roomVoiceDebug.set(
+    roomId,
+    `transcript: ${rawText}\nstatus: transcribed\nstatus: sending to command parser`
+  );
   voiceLog("transcript", { roomId, rawText });
   paintVoiceStatus(roomId);
   try {
-    const snapshot = await requestSnapshot("/api/voice/command", {
+    const snapshot = await requestInteractiveSnapshot("/api/voice/command", {
       method: "POST",
       body: JSON.stringify({
         room_id: roomId,
         raw_text: rawText,
       }),
     });
-    if (snapshot) {
-      const debugPayload = snapshot.voice_debug || {};
-      roomVoiceDebug.set(
+    const debugPayload = snapshot.voice_debug || {};
+    const elapsedMs = Math.round(performance.now() - startedAt);
+    roomVoiceDebug.set(
+      roomId,
+      [
+        `transcript: ${debugPayload.transcript || rawText}`,
+        `status: parser response received in ${elapsedMs}ms`,
+        `parser_source: ${debugPayload.parser_source || "unknown"}`,
+        `model: ${debugPayload.model || "n/a"}`,
+        `llm_output: ${debugPayload.llm_output || JSON.stringify(snapshot.voice_command || {}, null, 2)}`,
+        `command: ${JSON.stringify(snapshot.voice_command || {}, null, 2)}`,
+        `error: ${debugPayload.error || "none"}`,
+      ].join("\n")
+    );
+    if (snapshot.voice_command) {
+      roomVoiceFeedback.set(
         roomId,
-        [
-          `transcript: ${debugPayload.transcript || rawText}`,
-          `parser_source: ${debugPayload.parser_source || "unknown"}`,
-          `model: ${debugPayload.model || "n/a"}`,
-          `llm_output: ${debugPayload.llm_output || JSON.stringify(snapshot.voice_command || {}, null, 2)}`,
-          `command: ${JSON.stringify(snapshot.voice_command || {}, null, 2)}`,
-          `error: ${debugPayload.error || "none"}`,
-        ].join("\n")
+        `${snapshot.voice_command.intent} · ${snapshot.voice_command.reason}`
       );
-      if (snapshot.voice_command) {
-        roomVoiceFeedback.set(
-          roomId,
-          `${snapshot.voice_command.intent} · ${snapshot.voice_command.reason}`
-        );
-      }
-      voiceLog("parse:result", {
-        roomId,
-        transcript: rawText,
-        voiceDebug: debugPayload,
-        command: snapshot.voice_command,
-      });
-      renderSnapshot(snapshot);
     }
+    voiceLog("parse:result", {
+      roomId,
+      transcript: rawText,
+      elapsedMs,
+      voiceDebug: debugPayload,
+      command: snapshot.voice_command,
+    });
+    renderSnapshot(snapshot);
   } catch (error) {
     roomVoiceFeedback.set(roomId, `Voice parse failed: ${error.message}`);
     roomVoiceDebug.set(roomId, `transcript: ${rawText}\nerror: ${error.message}`);
     voiceError("parse:failed", { roomId, rawText, error: error.message });
-    document.getElementById("deviceMessage").textContent = error.message;
+    setNodeText("deviceMessage", error.message);
     await refreshDashboard();
+  } finally {
+    activeCommandProcessingRoomId = null;
+    paintVoiceStatus(roomId);
   }
+}
+
+function speakText(text, callbacks = {}) {
+  const { onend, onerror } = callbacks;
+  if (!("speechSynthesis" in window) || !text) {
+    if (onend) {
+      onend();
+    }
+    return;
+  }
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 1.06;
+  utterance.pitch = 1;
+  utterance.onend = () => {
+    if (onend) {
+      onend();
+    }
+  };
+  utterance.onerror = (event) => {
+    voiceError("assist:speech:error", { error: event.error || "unknown" });
+    if (onerror) {
+      onerror(event);
+    }
+    if (onend) {
+      onend();
+    }
+  };
+  window.speechSynthesis.speak(utterance);
+}
+
+async function startVoiceAssist(roomId) {
+  voiceLog("assist:start:click", { roomId });
+  setAssistState(roomId, { ui_state: "loading", awaiting_reply: false });
+  roomVoiceFeedback.set(roomId, "Preparing room suggestion...");
+  roomVoiceDebug.set(roomId, "assist:start: requesting room summary from backend");
+  paintVoiceStatus(roomId);
+  try {
+    const snapshot = await requestInteractiveSnapshot("/api/voice/assist/start", {
+      method: "POST",
+      body: JSON.stringify({ room_id: roomId }),
+    });
+    const assist = snapshot.voice_assist || {};
+    setAssistState(roomId, {
+      ...assist,
+      ui_state: "awaiting_reply",
+      awaiting_reply: true,
+    });
+    roomVoiceFeedback.set(roomId, assist.spoken_text || "Voice assist started.");
+    roomVoiceDebug.set(
+      roomId,
+      [
+        `assist_source: ${snapshot.voice_assist_debug?.source || "unknown"}`,
+        `summary: ${assist.summary || ""}`,
+        `spoken_text: ${assist.spoken_text || ""}`,
+        `suggested_intent: ${assist.suggested_intent || ""}`,
+        `llm_output: ${snapshot.voice_assist_debug?.llm_output || "n/a"}`,
+        `error: ${snapshot.voice_assist_debug?.error || "none"}`,
+      ].join("\n")
+    );
+    voiceLog("assist:start:result", {
+      roomId,
+      assist,
+      debug: snapshot.voice_assist_debug || {},
+    });
+    renderSnapshot(snapshot);
+    roomVoiceFeedback.set(roomId, "Speaking room suggestion...");
+    paintVoiceStatus(roomId);
+    speakText(assist.spoken_text || "", {
+      onend: () => {
+        if (assistState(roomId) === "awaiting_reply") {
+          roomVoiceFeedback.set(roomId, "Listening for your reply...");
+          roomVoiceDebug.set(roomId, "assist:reply:capture: waiting for one reply");
+          paintVoiceStatus(roomId);
+          startVoiceAssistCapture(roomId);
+        }
+      },
+    });
+  } catch (error) {
+    roomVoiceAssist.delete(roomId);
+    roomVoiceFeedback.set(roomId, `Voice assist failed: ${error.message}`);
+    roomVoiceDebug.set(roomId, `assist:start:error: ${error.message}`);
+    voiceError("assist:start:failed", { roomId, error: error.message });
+    paintVoiceStatus(roomId);
+    setNodeText("deviceMessage", error.message);
+  }
+}
+
+async function submitVoiceAssistReply(roomId, rawText) {
+  voiceLog("assist:reply:submit", { roomId, rawText });
+  setAssistState(roomId, { ui_state: "replying", awaiting_reply: false });
+  roomVoiceFeedback.set(roomId, "Applying your reply...");
+  roomVoiceDebug.set(roomId, `user_reply: ${rawText}\nassist:reply: sending to backend`);
+  paintVoiceStatus(roomId);
+  try {
+    const snapshot = await requestInteractiveSnapshot("/api/voice/assist/reply", {
+      method: "POST",
+      body: JSON.stringify({
+        room_id: roomId,
+        raw_text: rawText,
+      }),
+    });
+    const assist = snapshot.voice_assist || {};
+    roomVoiceAssist.delete(roomId);
+    roomVoiceFeedback.set(roomId, assist.acknowledgement || "Voice assist completed.");
+    roomVoiceDebug.set(
+      roomId,
+      [
+        `user_reply: ${rawText}`,
+        `assist_source: ${snapshot.voice_assist_debug?.source || "unknown"}`,
+        `command: ${JSON.stringify(assist, null, 2)}`,
+        `llm_output: ${snapshot.voice_assist_debug?.llm_output || "n/a"}`,
+        `error: ${snapshot.voice_assist_debug?.error || "none"}`,
+      ].join("\n")
+    );
+    voiceLog("assist:reply:result", {
+      roomId,
+      rawText,
+      assist,
+      debug: snapshot.voice_assist_debug || {},
+    });
+    renderSnapshot(snapshot);
+    speakText(assist.acknowledgement || "");
+  } catch (error) {
+    roomVoiceAssist.delete(roomId);
+    roomVoiceFeedback.set(roomId, `Voice assist reply failed: ${error.message}`);
+    roomVoiceDebug.set(roomId, `assist:reply:error: ${error.message}`);
+    voiceError("assist:reply:failed", { roomId, rawText, error: error.message });
+    paintVoiceStatus(roomId);
+    setNodeText("deviceMessage", error.message);
+  }
+}
+
+function startVoiceAssistCapture(roomId) {
+  voiceLog("assist:reply:capture:start", { roomId });
+  setAssistState(roomId, { ui_state: "capturing_reply", awaiting_reply: true });
+  activeAssistListeningRoomId = roomId;
+  if (!SpeechRecognition) {
+    voiceLog("assist:reply:capture:fallback-prompt", { roomId });
+    roomVoiceFeedback.set(roomId, "Waiting for your one reply...");
+    roomVoiceDebug.set(roomId, "assist:reply:capture: using text prompt fallback");
+    paintVoiceStatus(roomId);
+    const typedReply = window.prompt("Reply to the room assistant:");
+    if (typedReply) {
+      submitVoiceAssistReply(roomId, typedReply.trim());
+    } else {
+      roomVoiceFeedback.set(roomId, "No reply captured. Tap the speaker again to retry.");
+      roomVoiceDebug.set(roomId, "assist:reply:capture:fallback-prompt: cancelled");
+      setAssistState(roomId, { ui_state: "idle", awaiting_reply: false });
+      activeAssistListeningRoomId = null;
+      paintVoiceStatus(roomId);
+    }
+    return;
+  }
+  if (activeRecognition) {
+    activeRecognition.stop();
+  }
+  const recognition = new SpeechRecognition();
+  activeRecognition = recognition;
+  recognition.lang = "en-IN";
+  recognition.interimResults = false;
+  recognition.maxAlternatives = 1;
+  let transcriptCaptured = false;
+  roomVoiceFeedback.set(roomId, "Listening for your one reply...");
+  roomVoiceDebug.set(roomId, "assist:awaiting_reply: browser speech recognition listening");
+  paintVoiceStatus(roomId);
+  const timeoutId = window.setTimeout(() => {
+    if (!transcriptCaptured) {
+      voiceLog("assist:reply:capture:timeout", { roomId });
+      recognition.stop();
+      roomVoiceFeedback.set(roomId, "No reply heard. Tap the speaker again to retry.");
+      roomVoiceDebug.set(roomId, "assist:reply:capture:timeout");
+      setAssistState(roomId, { ui_state: "idle", awaiting_reply: false });
+      paintVoiceStatus(roomId);
+    }
+  }, VOICE_ASSIST_REPLY_TIMEOUT_MS);
+  recognition.onresult = async (event) => {
+    window.clearTimeout(timeoutId);
+    transcriptCaptured = true;
+    const transcript = event.results[0][0].transcript.trim();
+    voiceLog("assist:reply:capture:result", { roomId, transcript });
+    await submitVoiceAssistReply(roomId, transcript);
+  };
+  recognition.onerror = (event) => {
+    window.clearTimeout(timeoutId);
+    roomVoiceAssist.delete(roomId);
+    activeAssistListeningRoomId = null;
+    roomVoiceFeedback.set(roomId, "Voice assist reply failed. Try the speaker button again.");
+    roomVoiceDebug.set(roomId, `assist:error: ${event.error || "unknown"}`);
+    voiceError("assist:reply:capture:error", { roomId, error: event.error || "unknown" });
+    paintVoiceStatus(roomId);
+  };
+  recognition.onend = () => {
+    window.clearTimeout(timeoutId);
+    activeRecognition = null;
+    activeAssistListeningRoomId = null;
+    voiceLog("assist:reply:capture:end", { roomId });
+    if (!transcriptCaptured && assistState(roomId) !== "replying") {
+      setAssistState(roomId, { ui_state: "idle", awaiting_reply: false });
+    }
+    paintVoiceStatus(roomId);
+  };
+  recognition.start();
 }
 
 function startRoomVoiceCapture(roomId) {
@@ -1226,6 +1686,9 @@ function startRoomVoiceCapture(roomId) {
   recognition.onresult = async (event) => {
     const transcript = event.results[0][0].transcript.trim();
     voiceLog("listening:result", { roomId, transcript });
+    roomVoiceFeedback.set(roomId, `Transcribed: "${transcript}"`);
+    roomVoiceDebug.set(roomId, `transcript: ${transcript}\nstatus: captured from browser speech recognition`);
+    paintVoiceStatus(roomId);
     await submitVoiceCommand(roomId, transcript);
   };
   recognition.onerror = (event) => {
@@ -1244,6 +1707,18 @@ function startRoomVoiceCapture(roomId) {
 }
 
 document.getElementById("houseGrid").addEventListener("click", async (event) => {
+  const speakerButton = event.target.closest("[data-voice-kind='speaker']");
+  if (speakerButton && !speakerButton.disabled) {
+    const roomId = speakerButton.dataset.roomId;
+    const assist = roomVoiceAssist.get(roomId);
+    voiceLog("assist:speaker:click", { roomId, awaitingReply: !!assist?.awaiting_reply });
+    if (assist?.awaiting_reply) {
+      startVoiceAssistCapture(roomId);
+    } else {
+      await startVoiceAssist(roomId);
+    }
+    return;
+  }
   const micButton = event.target.closest("[data-voice-kind='mic']");
   if (micButton && !micButton.disabled) {
     voiceLog("mic:click", { roomId: micButton.dataset.roomId });
@@ -1264,10 +1739,17 @@ document.getElementById("houseGrid").addEventListener("click", async (event) => 
       return;
     }
     const stepperValue = card.root.querySelector(`#occupancy-stepper-${roomId}`);
-    const nextValue = Math.max(0, Math.min(5, Number(stepperValue.textContent) + Number(stepperButton.dataset.occupancyStep)));
+    const nextValue = Math.max(0, Math.min(MAX_OCCUPANCY, Number(stepperValue.textContent) + Number(stepperButton.dataset.occupancyStep)));
     const occupancyValue = card.root.querySelector(`#sensor-value-${roomId}-occupancy_count`);
     if (occupancyValue) occupancyValue.textContent = `${nextValue} persons`;
     if (stepperValue) stepperValue.textContent = String(nextValue);
+    if (card.occupancyDown) {
+      card.occupancyDown.disabled = nextValue <= 0;
+    }
+    if (card.occupancyUp) {
+      card.occupancyUp.disabled = nextValue >= MAX_OCCUPANCY;
+    }
+    pendingOccupancy.set(roomId, nextValue);
     previewMetricsForRoom(roomId, { occupancy_count: nextValue });
     scheduleRoomSensorUpdate(roomId, card.root, 60);
   }
@@ -1332,18 +1814,21 @@ document.getElementById("houseGrid").addEventListener("change", async (event) =>
   }
 });
 
-document.getElementById("runDecisionButton").addEventListener("click", async () => {
-  try {
-    const snapshot = await requestSnapshot("/api/decision/evaluate", {
-      method: "POST",
-    });
-    if (snapshot) {
-      renderSnapshot(snapshot);
+const runDecisionButton = document.getElementById("runDecisionButton");
+if (runDecisionButton) {
+  runDecisionButton.addEventListener("click", async () => {
+    try {
+      const snapshot = await requestSnapshot("/api/decision/evaluate", {
+        method: "POST",
+      });
+      if (snapshot) {
+        renderSnapshot(snapshot);
+      }
+    } catch (error) {
+      setNodeText("deviceMessage", error.message);
     }
-  } catch (error) {
-    document.getElementById("deviceMessage").textContent = error.message;
-  }
-});
+  });
+}
 
 document.getElementById("viewTabs").addEventListener("click", (event) => {
   const tab = event.target.closest("[data-view]");
@@ -1371,15 +1856,15 @@ document.getElementById("dashboardRangeTabs").addEventListener("click", (event) 
   }
 });
 
-document.getElementById("dashboardRoomFilters").addEventListener("click", (event) => {
-  const tab = event.target.closest("[data-room-filter]");
-  if (!tab) {
-    return;
+document.getElementById("dashboardRoomSelect").addEventListener("change", (event) => {
+  dashboardRoomFilter = event.target.value;
+  if (latestSnapshot?.dashboard) {
+    renderDashboard(latestSnapshot.dashboard);
   }
-  dashboardRoomFilter = tab.dataset.roomFilter;
-  document.querySelectorAll("[data-room-filter]").forEach((node) => {
-    node.classList.toggle("active", node === tab);
-  });
+});
+
+document.getElementById("dashboardTrendSelect").addEventListener("change", (event) => {
+  dashboardTrendWindow = event.target.value;
   if (latestSnapshot?.dashboard) {
     renderDashboard(latestSnapshot.dashboard);
   }
