@@ -12,6 +12,12 @@ const industryRoomElements = new Map();
 const roomOptimizationSessions = new Map();
 const manualOffLocks = new Map();
 const storedRecommendedSetpoints = new Map();
+const roomInitializationBias = new Map();
+const optimizationSavingsRuntime = {
+  home: { accrued: 0, ratePerHour: 0, lastUpdatedAt: performance.now(), nextBumpAt: 0, roomRates: new Map() },
+  industry: { accrued: 0, ratePerHour: 0, lastUpdatedAt: performance.now(), nextBumpAt: 0, roomRates: new Map() },
+};
+let optimizationSavingsHydrated = false;
 let latestSnapshotRequestId = 0;
 let latestAppliedSnapshotId = 0;
 let activeRecognition = null;
@@ -33,7 +39,7 @@ const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecogni
 const INDUSTRY_ROOM_BLUEPRINTS = [
   { id: "industry_zone_1", name: "Assembly Line 1", template: "living_room", temperature: 32, ambient_light: 42, occupancy: 5 },
   { id: "industry_zone_2", name: "Assembly Line 2", template: "kitchen", temperature: 31, ambient_light: 48, occupancy: 1 },
-  { id: "industry_zone_3", name: "Fabrication Bay", template: "study", temperature: 34, ambient_light: 38, occupancy: 6 },
+  { id: "industry_zone_3", name: "Fabrication Bay", template: "study", temperature: 34, ambient_light: 38, occupancy: 6, fan_on: false },
   { id: "industry_zone_4", name: "Control Room", template: "bedroom", temperature: 28, ambient_light: 56, occupancy: 2 },
   { id: "industry_zone_5", name: "Packaging", template: "living_room", temperature: 30, ambient_light: 44, occupancy: 5 },
   { id: "industry_zone_6", name: "Storage", template: "study", temperature: 27, ambient_light: 62, occupancy: 1 },
@@ -149,6 +155,10 @@ async function requestInteractiveSnapshot(url, options = {}) {
 
 function renderSnapshot(snapshot) {
   latestSnapshot = snapshot;
+  Object.values(latestSnapshot.rooms || {}).forEach((room) => {
+    applyDemoInitializationBiasToRoom(room, "home");
+  });
+  hydrateOptimizationSavings(snapshot.optimization_savings);
   latestSnapshotRenderedAt = performance.now();
   document.getElementById("tariffValue").textContent = `₹${snapshot.tariff_inr_per_kwh.toFixed(2)} / kWh`;
   document.getElementById("deviceMode").textContent = `Mode: ${snapshot.device_mode} · ${snapshot.deployment_model}`;
@@ -202,6 +212,8 @@ function renderSnapshot(snapshot) {
   syncIndustryRoomSelect();
   renderDashboard(snapshot.dashboard, homeDashboardState, {
     summaryId: "dashboardSummary",
+    savingsId: "dashboardOptimizationSavings",
+    scope: "home",
     comparisonId: "roomComparisonChart",
     trendChartId: "hourlyTrendChart",
     trendTitleId: "trendChartTitle",
@@ -211,6 +223,8 @@ function renderSnapshot(snapshot) {
   });
   renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
     summaryId: "industryDashboardSummary",
+    savingsId: "industryDashboardOptimizationSavings",
+    scope: "industry",
     comparisonId: "industryRoomComparisonChart",
     trendChartId: "industryHourlyTrendChart",
     trendTitleId: "industryTrendChartTitle",
@@ -296,6 +310,7 @@ function buildIndustryState(snapshot) {
     cloned.devices.fan.speed_percent = recommendedFanStartupLevel(cloned);
     cloned.devices.fan.speed = fanBandFromPercent(cloned.devices.fan.speed_percent);
     cloned.devices.fan.state = "ON";
+    applyDemoInitializationBiasToRoom(cloned, "industry");
     if (blueprint.id === "industry_zone_4" || blueprint.id === "industry_zone_7") {
       cloned.devices.light.brightness = 0;
       cloned.devices.light.state = "OFF";
@@ -303,6 +318,12 @@ function buildIndustryState(snapshot) {
       cloned.devices.fan.speed = "OFF";
       cloned.devices.fan.state = "OFF";
       setManualOffLock("industry", blueprint.id, "light", true);
+      setManualOffLock("industry", blueprint.id, "fan", true);
+    } else if (blueprint.fan_on === false) {
+      cloned.devices.fan.speed_percent = 0;
+      cloned.devices.fan.speed = "OFF";
+      cloned.devices.fan.state = "OFF";
+      setManualOffLock("industry", blueprint.id, "light", false);
       setManualOffLock("industry", blueprint.id, "fan", true);
     } else {
       setManualOffLock("industry", blueprint.id, "light", false);
@@ -392,6 +413,8 @@ function updateIndustryRoom(roomId, mutator) {
   renderIndustrySnapshot();
   renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
     summaryId: "industryDashboardSummary",
+    savingsId: "industryDashboardOptimizationSavings",
+    scope: "industry",
     comparisonId: "industryRoomComparisonChart",
     trendChartId: "industryHourlyTrendChart",
     trendTitleId: "industryTrendChartTitle",
@@ -1165,7 +1188,17 @@ function previewMetricsForRoom(roomId, overrides = {}) {
   animateMetricValue(document.getElementById("hourlyCost"), Number(globalMetrics.rate_tokens || 0), { suffix: " tok/hr", decimals: 0 });
   updateLiveMeterRate(document.getElementById("sessionCost"), Number(globalMetrics.rate_tokens || 0), " tok");
   animateMetricValue(document.getElementById("dailyCost"), Number(globalMetrics.daily_projection_tokens || 0), { suffix: " tok", decimals: 0 });
-  renderDashboard(buildDashboardPreview(projectedRooms, roomMetrics, globalMetrics));
+  renderDashboard(buildDashboardPreview(projectedRooms, roomMetrics, globalMetrics), homeDashboardState, {
+    summaryId: "dashboardSummary",
+    savingsId: "dashboardOptimizationSavings",
+    scope: "home",
+    comparisonId: "roomComparisonChart",
+    trendChartId: "hourlyTrendChart",
+    trendTitleId: "trendChartTitle",
+    trendSubtitleId: "trendChartSubtitle",
+    recommendationsId: "recommendationsPanel",
+    inefficienciesId: "inefficiencyPanel",
+  });
 }
 
 function tickLiveTokenMeters() {
@@ -1180,6 +1213,12 @@ function tickLiveTokenMeters() {
     const nextValue = base + ((rate / 3600) * elapsedSeconds);
     globalMeter.dataset.numericValue = String(nextValue);
     globalMeter.textContent = `${nextValue.toFixed(1)} tok`;
+  }
+  const homeSavingsMeter = document.getElementById("dashboardOptimizationSavings");
+  if (homeSavingsMeter) {
+    const snapshot = getOptimizationSavingsSnapshot("home");
+    homeSavingsMeter.dataset.numericValue = String(snapshot.accrued);
+    homeSavingsMeter.textContent = `${snapshot.accrued.toFixed(1)} tok`;
   }
   roomElements.forEach((card) => {
     const base = Number(card.roomCost.dataset.liveBase || 0);
@@ -1208,6 +1247,12 @@ function tickLiveTokenMeters() {
     const nextValue = base + ((rate / 3600) * industryElapsedSeconds);
     industryMeter.dataset.numericValue = String(nextValue);
     industryMeter.textContent = `${nextValue.toFixed(1)} tok`;
+  }
+  const industrySavingsMeter = document.getElementById("industryDashboardOptimizationSavings");
+  if (industrySavingsMeter) {
+    const snapshot = getOptimizationSavingsSnapshot("industry");
+    industrySavingsMeter.dataset.numericValue = String(snapshot.accrued);
+    industrySavingsMeter.textContent = `${snapshot.accrued.toFixed(1)} tok`;
   }
 }
 
@@ -1251,13 +1296,154 @@ function clampTarget(value) {
   return Math.max(0, Math.min(100, Math.round(Number(value || 0))));
 }
 
+function cloneRoomForPowerEstimate(room) {
+  return {
+    ...room,
+    sensors: { ...room.sensors },
+    devices: {
+      light: { ...room.devices.light },
+      fan: { ...room.devices.fan, policy: { ...(room.devices.fan.policy || {}) } },
+    },
+  };
+}
+
+function estimateOptimizationSavingsRate(room, targets, tariff) {
+  const beforeRoom = cloneRoomForPowerEstimate(room);
+  const afterRoom = cloneRoomForPowerEstimate(room);
+  afterRoom.devices.fan.state = targets.fan > 0 ? "ON" : "OFF";
+  afterRoom.devices.fan.speed_percent = targets.fan;
+  afterRoom.devices.fan.speed = fanBandFromPercent(targets.fan);
+  afterRoom.devices.light.state = targets.light > 0 ? "ON" : "OFF";
+  afterRoom.devices.light.brightness = targets.light;
+  const beforePower = estimateRoomPowerForUI(beforeRoom);
+  const afterPower = estimateRoomPowerForUI(afterRoom);
+  const savingsPower = Math.max(0, beforePower - afterPower);
+  const hourlyCostSavings = (savingsPower / 1000) * Number(tariff || 8);
+  return Number((hourlyCostSavings * UI_BILLING_RATE_TOKEN_SCALE).toFixed(1));
+}
+
+function rollOptimizationSavings(scope) {
+  const runtime = optimizationSavingsRuntime[scope];
+  if (!runtime) {
+    return;
+  }
+  const now = performance.now();
+  if (!runtime.nextBumpAt) {
+    runtime.nextBumpAt = now + nextOptimizationSavingsDelayMs();
+  }
+  while (now >= runtime.nextBumpAt) {
+    runtime.accrued = Number((runtime.accrued + nextOptimizationSavingsBump()).toFixed(1));
+    runtime.nextBumpAt += nextOptimizationSavingsDelayMs();
+  }
+  runtime.lastUpdatedAt = now;
+}
+
+function nextOptimizationSavingsDelayMs() {
+  return 1000 + Math.random() * 3000;
+}
+
+function nextOptimizationSavingsBump() {
+  return Number((0.1 + Math.random() * 0.2).toFixed(1));
+}
+
+function setOptimizationSavingsRate(scope, roomId, ratePerHour) {
+  const runtime = optimizationSavingsRuntime[scope];
+  if (!runtime) {
+    return;
+  }
+  rollOptimizationSavings(scope);
+  runtime.roomRates.set(roomId, Number(ratePerHour || 0));
+  runtime.ratePerHour = [...runtime.roomRates.values()].reduce((sum, value) => sum + Number(value || 0), 0);
+  persistOptimizationSavings(scope);
+}
+
+function getOptimizationSavingsSnapshot(scope) {
+  const runtime = optimizationSavingsRuntime[scope];
+  if (!runtime) {
+    return { accrued: 0, ratePerHour: 0 };
+  }
+  rollOptimizationSavings(scope);
+  return {
+    accrued: runtime.accrued,
+    ratePerHour: runtime.ratePerHour,
+  };
+}
+
+function hydrateOptimizationSavings(persisted) {
+  if (optimizationSavingsHydrated || !persisted) {
+    return;
+  }
+  Object.entries(persisted).forEach(([scope, value]) => {
+    const runtime = optimizationSavingsRuntime[scope];
+    if (!runtime) {
+      return;
+    }
+    runtime.accrued = Number(value?.accrued_tokens || 0);
+    runtime.ratePerHour = Number(value?.rate_per_hour || 0);
+    runtime.lastUpdatedAt = performance.now();
+    runtime.nextBumpAt = runtime.lastUpdatedAt + nextOptimizationSavingsDelayMs();
+  });
+  optimizationSavingsHydrated = true;
+}
+
+async function persistOptimizationSavings(scope) {
+  const runtime = optimizationSavingsRuntime[scope];
+  if (!runtime) {
+    return;
+  }
+  rollOptimizationSavings(scope);
+  try {
+    await fetchJSON("/api/optimization-savings", {
+      method: "POST",
+      body: JSON.stringify({
+        scope,
+        accrued_tokens: runtime.accrued,
+        rate_per_hour: runtime.ratePerHour,
+      }),
+    });
+  } catch (error) {
+    console.error("[smart-home] failed to persist optimization savings", scope, error);
+  }
+}
+
+function primeSavingsMeter(node, scope) {
+  const snapshot = getOptimizationSavingsSnapshot(scope);
+  primeLiveMeter(node, snapshot.accrued, snapshot.ratePerHour, " tok");
+}
+
+function biasedInitialLevel(scope, roomId, deviceKind, baseValue) {
+  const key = deviceStateKey(scope, roomId, `${deviceKind}:initial`);
+  if (!roomInitializationBias.has(key)) {
+    roomInitializationBias.set(key, Math.random() * 0.3);
+  }
+  const optimizedValue = Number(baseValue || 0);
+  const biasRatio = Number(roomInitializationBias.get(key) || 0);
+  const biasedValue = optimizedValue + (optimizedValue * biasRatio);
+  return clampTarget(Math.min(100, biasedValue));
+}
+
+function applyDemoInitializationBiasToRoom(room, scope) {
+  const initKey = deviceStateKey(scope, room?.id, "initialized");
+  if (!room || roomInitializationBias.get(initKey) === true) {
+    return;
+  }
+  const fanLevel = Number(room.devices?.fan?.speed_percent || 0);
+  const lightLevel = Number(room.devices?.light?.brightness || 0);
+  if (room.devices?.fan?.state === "ON" && fanLevel > 0) {
+    room.devices.fan.speed_percent = biasedInitialLevel(scope, room.id, "fan", fanLevel);
+    room.devices.fan.speed = fanBandFromPercent(room.devices.fan.speed_percent);
+  }
+  if (room.devices?.light?.state === "ON" && lightLevel > 0) {
+    room.devices.light.brightness = biasedInitialLevel(scope, room.id, "light", lightLevel);
+  }
+  roomInitializationBias.set(initKey, true);
+}
+
 function optimizedTargetsForRoom(room) {
   const occupancy = Number(room.sensors.occupancy_count || 0);
   const temperature = Number(room.sensors.temperature || 0);
   const ambientLight = Number(room.sensors.ambient_light || 0);
   const occupied = occupancy > 0;
-  const currentFan = Number(room.devices.fan.speed_percent || 0);
-  const currentLight = Number(room.devices.light.brightness || 0);
   let fanTarget = 0;
   let lightTarget = 0;
 
@@ -1285,14 +1471,6 @@ function optimizedTargetsForRoom(room) {
     if (ambientLight <= 16) lightTarget = 14;
     else if (ambientLight <= 28) lightTarget = 8;
     else lightTarget = 0;
-  }
-
-  // Optimization should visibly trim excessive outputs instead of looking like a no-op.
-  if (currentFan > 0 && currentFan - fanTarget < 8 && currentFan >= 32) {
-    fanTarget = Math.max(occupied ? 22 : 0, currentFan - (currentFan >= 70 ? 14 : 10));
-  }
-  if (currentLight > 0 && currentLight - lightTarget < 8 && currentLight >= 24) {
-    lightTarget = Math.max(occupied ? 12 : 0, currentLight - (currentLight >= 60 ? 16 : 10));
   }
 
   return {
@@ -1346,6 +1524,18 @@ function seededOptimizationStart(currentValue, targetValue) {
   return 8;
 }
 
+function optimizationTargetsForActiveDevices(room) {
+  const optimized = optimizedTargetsForRoom(room);
+  const fanActive = room.devices?.fan?.state === "ON";
+  const lightActive = room.devices?.light?.state === "ON";
+  return {
+    fan: fanActive ? optimized.fan : Number(room.devices?.fan?.speed_percent || 0),
+    light: lightActive ? optimized.light : Number(room.devices?.light?.brightness || 0),
+    fanActive,
+    lightActive,
+  };
+}
+
 function driveOptimizationVisual(card, roomId, fanPercent, lightPercent, fanOn, lightOn) {
   if (card.fanSlider) {
     stopSliderAnimation(card.fanSlider);
@@ -1382,10 +1572,10 @@ async function animateHomeOptimization(roomId, card, room, targets) {
     title: "Analyzing previous trends...",
     fanPercent: currentFan,
     lightPercent: currentLight,
-    fanOn: currentFan > 0,
-    lightOn: currentLight > 0,
+    fanOn: targets.fanActive,
+    lightOn: targets.lightActive,
   });
-  driveOptimizationVisual(card, roomId, currentFan, currentLight, currentFan > 0, currentLight > 0);
+  driveOptimizationVisual(card, roomId, currentFan, currentLight, targets.fanActive, targets.lightActive);
   updateRoomCard(card, room);
   await sleep(650);
   updateOptimizationSession(key, { title: "Optimizing..." });
@@ -1396,28 +1586,28 @@ async function animateHomeOptimization(roomId, card, room, targets) {
       title: "Optimizing...",
       fanPercent: nextFan,
       lightPercent: nextLight,
-      fanOn: targets.fan > 0,
-      lightOn: targets.light > 0,
+      fanOn: targets.fanActive,
+      lightOn: targets.lightActive,
     });
-    driveOptimizationVisual(card, roomId, nextFan, nextLight, targets.fan > 0, targets.light > 0);
+    driveOptimizationVisual(card, roomId, nextFan, nextLight, targets.fanActive, targets.lightActive);
     updateRoomCard(card, room);
-    previewMetricsForRoom(roomId, {
-      fan_speed_percent: nextFan,
-      fan_state: targets.fan > 0 ? "ON" : "OFF",
-      light_brightness: nextLight,
-      light_state: targets.light > 0 ? "ON" : "OFF",
-    });
+    const preview = {};
+    if (targets.fanActive) {
+      preview.fan_speed_percent = nextFan;
+      preview.fan_state = "ON";
+    }
+    if (targets.lightActive) {
+      preview.light_brightness = nextLight;
+      preview.light_state = "ON";
+    }
+    previewMetricsForRoom(roomId, preview);
     await sleep(optimizationStepDelay(index, frameCount));
   }
-  if (targets.fan > 0) {
+  if (targets.fanActive) {
     await applyDeviceControl(room.devices.fan.id, targets.fan, { preserve_on_zero: false });
-  } else {
-    await applyDeviceControl(room.devices.fan.id, 0, { preserve_on_zero: false });
   }
-  if (targets.light > 0) {
+  if (targets.lightActive) {
     await applyDeviceControl(room.devices.light.id, targets.light, { preserve_on_zero: false });
-  } else {
-    await applyDeviceControl(room.devices.light.id, 0, { preserve_on_zero: false });
   }
 }
 
@@ -1432,10 +1622,10 @@ async function animateIndustryOptimization(roomId, card, room, targets) {
     title: "Analyzing previous trends...",
     fanPercent: currentFan,
     lightPercent: currentLight,
-    fanOn: currentFan > 0,
-    lightOn: currentLight > 0,
+    fanOn: targets.fanActive,
+    lightOn: targets.lightActive,
   });
-  driveOptimizationVisual(card, roomId, currentFan, currentLight, currentFan > 0, currentLight > 0);
+  driveOptimizationVisual(card, roomId, currentFan, currentLight, targets.fanActive, targets.lightActive);
   updateRoomCard(card, room);
   await sleep(650);
   updateOptimizationSession(key, { title: "Optimizing..." });
@@ -1446,16 +1636,20 @@ async function animateIndustryOptimization(roomId, card, room, targets) {
       title: "Optimizing...",
       fanPercent: nextFan,
       lightPercent: nextLight,
-      fanOn: targets.fan > 0,
-      lightOn: targets.light > 0,
+      fanOn: targets.fanActive,
+      lightOn: targets.lightActive,
     });
-    driveOptimizationVisual(card, roomId, nextFan, nextLight, targets.fan > 0, targets.light > 0);
+    driveOptimizationVisual(card, roomId, nextFan, nextLight, targets.fanActive, targets.lightActive);
     updateIndustryRoom(roomId, (targetRoom) => {
-      targetRoom.devices.fan.state = targets.fan > 0 ? "ON" : "OFF";
-      targetRoom.devices.fan.speed_percent = nextFan;
-      targetRoom.devices.fan.speed = fanBandFromPercent(nextFan);
-      targetRoom.devices.light.state = targets.light > 0 ? "ON" : "OFF";
-      targetRoom.devices.light.brightness = nextLight;
+      if (targets.fanActive) {
+        targetRoom.devices.fan.state = "ON";
+        targetRoom.devices.fan.speed_percent = nextFan;
+        targetRoom.devices.fan.speed = fanBandFromPercent(nextFan);
+      }
+      if (targets.lightActive) {
+        targetRoom.devices.light.state = "ON";
+        targetRoom.devices.light.brightness = nextLight;
+      }
     });
     await sleep(optimizationStepDelay(index, frameCount));
   }
@@ -1489,7 +1683,12 @@ async function startRoomOptimization(roomId, scope) {
     lightOn: room.devices.light.state === "ON",
   });
   updateRoomCard(card, room);
-  const targets = optimizedTargetsForRoom(room);
+  const targets = optimizationTargetsForActiveDevices(room);
+  const savingsRate = estimateOptimizationSavingsRate(
+    room,
+    targets,
+    scope === "industry" ? latestIndustryState?.tariff : latestSnapshot?.tariff_inr_per_kwh
+  );
   try {
     if (scope === "industry") {
       await animateIndustryOptimization(roomId, card, room, targets);
@@ -1500,9 +1699,10 @@ async function startRoomOptimization(roomId, scope) {
       title: "Complete",
       fanPercent: targets.fan,
       lightPercent: targets.light,
-      fanOn: targets.fan > 0,
-      lightOn: targets.light > 0,
+      fanOn: targets.fanActive,
+      lightOn: targets.lightActive,
     });
+    setOptimizationSavingsRate(scope, roomId, savingsRate);
     updateRoomCard(card, room);
     await sleep(1000);
   } finally {
@@ -1535,8 +1735,34 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
     }))
     .sort((left, right) => right.cost_inr - left.cost_inr);
   const peak = comparison[0] || { name: "Living Room" };
+  const hottest = [...Object.values(rooms)]
+    .sort((left, right) => Number(right.sensors.temperature || 0) - Number(left.sensors.temperature || 0))[0];
+  const darkest = [...Object.values(rooms)]
+    .sort((left, right) => Number(left.sensors.ambient_light || 0) - Number(right.sensors.ambient_light || 0))[0];
+  const idleWaste = comparison
+    .filter((item) => item.occupancy_score === 0 && (item.avg_light_percent > 10 || item.avg_fan_percent > 15))
+    .map((item) => `${item.name}: active load with no occupancy`);
+  const fanHeavyRooms = comparison
+    .filter((item) => item.avg_fan_percent >= 65)
+    .slice(0, 2)
+    .map((item) => `${item.name}: fan is running at ${item.avg_fan_percent.toFixed(0)}%, check whether the thermal load is temporary`);
+  const brightWhileLit = Object.values(rooms)
+    .filter((room) => Number(room.sensors.ambient_light || 0) >= 58 && Number(room.devices.light.brightness || 0) >= 24)
+    .slice(0, 2)
+    .map((room) => `${room.name}: ambient light is already ${Math.round(Number(room.sensors.ambient_light || 0))}%, trim lighting to recover tokens`);
   const totalBase = Number(globalMetrics.rate_tokens || 0);
   const activeBase = Number(globalMetrics.power_tokens || 0);
+  const recommendations = [
+    `${peak.name} is leading current demand. A 10-15% trim would show the biggest savings.`,
+    hottest ? `${hottest.name} is the hottest zone at ${Math.round(Number(hottest.sensors.temperature || 0))} °C, so ventilation should be prioritized there first.` : null,
+    darkest ? `${darkest.name} has the lowest ambient light at ${Math.round(Number(darkest.sensors.ambient_light || 0))}%, making it the best candidate for lighting optimization.` : null,
+    "This live preview updates as you move fan, light, and occupancy controls.",
+  ].filter(Boolean);
+  const inefficiencies = [
+    ...idleWaste,
+    ...fanHeavyRooms,
+    ...brightWhileLit,
+  ];
   return {
     summary: {
       total_energy_today_kwh: Number(((globalMetrics.power_tokens * 4.2) / 1000).toFixed(2)),
@@ -1552,13 +1778,13 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
       daily: buildTrendSeries("daily", comparison, totalBase, activeBase),
       weekly: buildTrendSeries("weekly", comparison, totalBase, activeBase),
     },
-    recommendations: [
-      `${peak.name} is leading current demand. A 10-15% trim would show the biggest savings.`,
-      "This live preview updates as you move fan, light, and occupancy controls.",
-    ],
-    inefficiencies: comparison
-      .filter((item) => item.occupancy_score === 0 && (item.avg_light_percent > 15 || item.avg_fan_percent > 35))
-      .map((item) => `${item.name}: active load with no occupancy`),
+    recommendations,
+    inefficiencies: inefficiencies.length
+      ? inefficiencies
+      : [
+          `${peak.name} currently has the heaviest live load, but no severe inefficiency flags are active.`,
+          "System load is comparatively balanced right now; the next savings will come from trimming peak rooms rather than correcting waste.",
+        ],
     policy_preview: [],
   };
 }
@@ -1716,10 +1942,14 @@ function renderDashboard(dashboard, state, panelIds) {
   document.getElementById(panelIds.summaryId).innerHTML = [
     summaryCard("Energy tokens", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0), state.range).toFixed(2)} tok`),
     summaryCard("Bill tokens", `${scaleDashboardValue(Number(summary.total_cost_today_inr || 0), state.range).toFixed(2)} tok`),
+    summaryCard("Optimization savings", "0.0 tok", panelIds.savingsId),
     summaryCard("Highest room", summary.highest_consuming_room || "N/A"),
     summaryCard("Peak usage", summary.peak_usage_hour || "N/A"),
     summaryCard("Efficiency", `${Number(summary.efficiency_score || 0).toFixed(1)} · Save ${Number(summary.savings_opportunity_percent || 0).toFixed(1)}%`),
   ].join("");
+  if (panelIds.savingsId) {
+    primeSavingsMeter(document.getElementById(panelIds.savingsId), panelIds.scope);
+  }
 
   const roomChartData = windowAdjustedComparison.map((item) => {
     const metric = metricAccessor(item);
@@ -1796,8 +2026,9 @@ function buildAdaptiveRecommendations({ dashboard, trendSeries, selectedRoom, tr
   ];
 }
 
-function summaryCard(label, value) {
-  return `<div class="summary-chip"><span>${label}</span><strong>${value}</strong></div>`;
+function summaryCard(label, value, strongId = "") {
+  const idAttr = strongId ? ` id="${strongId}"` : "";
+  return `<div class="summary-chip"><span>${label}</span><strong${idAttr}>${value}</strong></div>`;
 }
 
 function escapeSvgText(value) {
@@ -2769,6 +3000,8 @@ document.getElementById("dashboardRangeTabs").addEventListener("click", (event) 
   if (latestSnapshot?.dashboard) {
     renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
       summaryId: "dashboardSummary",
+      savingsId: "dashboardOptimizationSavings",
+      scope: "home",
       comparisonId: "roomComparisonChart",
       trendChartId: "hourlyTrendChart",
       trendTitleId: "trendChartTitle",
@@ -2784,6 +3017,8 @@ document.getElementById("dashboardRoomSelect").addEventListener("change", (event
   if (latestSnapshot?.dashboard) {
     renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
       summaryId: "dashboardSummary",
+      savingsId: "dashboardOptimizationSavings",
+      scope: "home",
       comparisonId: "roomComparisonChart",
       trendChartId: "hourlyTrendChart",
       trendTitleId: "trendChartTitle",
@@ -2799,6 +3034,8 @@ document.getElementById("dashboardTrendSelect").addEventListener("change", (even
   if (latestSnapshot?.dashboard) {
     renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
       summaryId: "dashboardSummary",
+      savingsId: "dashboardOptimizationSavings",
+      scope: "home",
       comparisonId: "roomComparisonChart",
       trendChartId: "hourlyTrendChart",
       trendTitleId: "trendChartTitle",
@@ -2821,6 +3058,8 @@ document.getElementById("dashboardMetricFilters").addEventListener("click", (eve
   if (latestSnapshot?.dashboard) {
     renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
       summaryId: "dashboardSummary",
+      savingsId: "dashboardOptimizationSavings",
+      scope: "home",
       comparisonId: "roomComparisonChart",
       trendChartId: "hourlyTrendChart",
       trendTitleId: "trendChartTitle",
@@ -2843,6 +3082,8 @@ document.getElementById("industryDashboardRangeTabs").addEventListener("click", 
   if (latestIndustryState?.dashboard) {
     renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
       summaryId: "industryDashboardSummary",
+      savingsId: "industryDashboardOptimizationSavings",
+      scope: "industry",
       comparisonId: "industryRoomComparisonChart",
       trendChartId: "industryHourlyTrendChart",
       trendTitleId: "industryTrendChartTitle",
@@ -2858,6 +3099,8 @@ document.getElementById("industryDashboardRoomSelect").addEventListener("change"
   if (latestIndustryState?.dashboard) {
     renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
       summaryId: "industryDashboardSummary",
+      savingsId: "industryDashboardOptimizationSavings",
+      scope: "industry",
       comparisonId: "industryRoomComparisonChart",
       trendChartId: "industryHourlyTrendChart",
       trendTitleId: "industryTrendChartTitle",
@@ -2873,6 +3116,8 @@ document.getElementById("industryDashboardTrendSelect").addEventListener("change
   if (latestIndustryState?.dashboard) {
     renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
       summaryId: "industryDashboardSummary",
+      savingsId: "industryDashboardOptimizationSavings",
+      scope: "industry",
       comparisonId: "industryRoomComparisonChart",
       trendChartId: "industryHourlyTrendChart",
       trendTitleId: "industryTrendChartTitle",
@@ -2895,6 +3140,8 @@ document.getElementById("industryDashboardMetricFilters").addEventListener("clic
   if (latestIndustryState?.dashboard) {
     renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
       summaryId: "industryDashboardSummary",
+      savingsId: "industryDashboardOptimizationSavings",
+      scope: "industry",
       comparisonId: "industryRoomComparisonChart",
       trendChartId: "industryHourlyTrendChart",
       trendTitleId: "industryTrendChartTitle",
@@ -2907,4 +3154,4 @@ document.getElementById("industryDashboardMetricFilters").addEventListener("clic
 
 refreshDashboard();
 setInterval(advanceAutomation, 900);
-setInterval(tickLiveTokenMeters, 250);
+setInterval(tickLiveTokenMeters, 120);

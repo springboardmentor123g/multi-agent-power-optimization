@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -9,6 +10,11 @@ from home_layout import DEFAULT_APPLIANCES, DEFAULT_ROOM_SENSOR, FAN_SPEED_MULTI
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("POWER_OPT_DB_PATH", BASE_DIR / "power_optimization.db"))
 DEFAULT_HUMIDITY = 55.0
+OPTIMIZATION_SAVINGS_SCOPES = ("home", "industry")
+DEFAULT_OPTIMIZATION_SAVINGS_STATE = {
+    "home": {"accrued_tokens": 186.4, "rate_per_hour": 7.8},
+    "industry": {"accrued_tokens": 428.7, "rate_per_hour": 16.5},
+}
 
 
 def get_connection():
@@ -18,6 +24,7 @@ def get_connection():
 
 
 def init_db():
+    now_epoch = float(datetime.now(timezone.utc).timestamp())
     with get_connection() as connection:
         connection.executescript(
             """
@@ -214,6 +221,24 @@ def init_db():
             ON CONFLICT(key) DO NOTHING
             """
         )
+        for scope, state in DEFAULT_OPTIMIZATION_SAVINGS_STATE.items():
+            connection.execute(
+                """
+                INSERT INTO system_settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (
+                    f"optimization_savings_{scope}",
+                    json.dumps(
+                        {
+                            "accrued_tokens": float(state["accrued_tokens"]),
+                            "rate_per_hour": float(state["rate_per_hour"]),
+                            "last_updated_epoch": now_epoch,
+                        }
+                    ),
+                ),
+            )
         connection.execute(
             """
             INSERT INTO runtime_meter_state (
@@ -525,6 +550,70 @@ def set_global_mode(mode):
                 updated_at = CURRENT_TIMESTAMP
             """,
             (mode,),
+        )
+        connection.commit()
+
+
+def get_optimization_savings_state(now_epoch=None):
+    current_epoch = float(now_epoch or datetime.now(timezone.utc).timestamp())
+    states = {
+        scope: {
+            "accrued_tokens": 0.0,
+            "rate_per_hour": 0.0,
+            "last_updated_epoch": current_epoch,
+        }
+        for scope in OPTIMIZATION_SAVINGS_SCOPES
+    }
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT key, value
+            FROM system_settings
+            WHERE key IN (?, ?)
+            """,
+            tuple(f"optimization_savings_{scope}" for scope in OPTIMIZATION_SAVINGS_SCOPES),
+        ).fetchall()
+    for row in rows:
+        key = row["key"]
+        scope = key.replace("optimization_savings_", "", 1)
+        if scope not in states:
+          continue
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        accrued_tokens = float(payload.get("accrued_tokens", 0.0) or 0.0)
+        rate_per_hour = float(payload.get("rate_per_hour", 0.0) or 0.0)
+        last_updated_epoch = float(payload.get("last_updated_epoch", current_epoch) or current_epoch)
+        elapsed_hours = max(0.0, min(24.0, (current_epoch - last_updated_epoch) / 3600))
+        states[scope] = {
+            "accrued_tokens": accrued_tokens + max(0.0, rate_per_hour * elapsed_hours),
+            "rate_per_hour": rate_per_hour,
+            "last_updated_epoch": current_epoch,
+        }
+    return states
+
+
+def save_optimization_savings_state(scope, accrued_tokens, rate_per_hour, now_epoch=None):
+    if scope not in OPTIMIZATION_SAVINGS_SCOPES:
+        raise ValueError(f"Unknown optimization savings scope: {scope}")
+    payload = json.dumps(
+        {
+            "accrued_tokens": float(accrued_tokens or 0.0),
+            "rate_per_hour": float(rate_per_hour or 0.0),
+            "last_updated_epoch": float(now_epoch or datetime.now(timezone.utc).timestamp()),
+        }
+    )
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO system_settings (key, value, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (f"optimization_savings_{scope}", payload),
         )
         connection.commit()
 

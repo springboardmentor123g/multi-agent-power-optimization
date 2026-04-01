@@ -31,11 +31,13 @@ from database import (
     get_runtime_meter_states,
     get_room_modes,
     get_latest_room_sensor_readings,
+    get_optimization_savings_state,
     init_db,
     log_decision,
     reset_room_modes,
     save_fan_policy_state,
     save_light_policy_state,
+    save_optimization_savings_state,
     set_global_mode,
     set_room_mode,
 )
@@ -94,6 +96,7 @@ def build_snapshot():
     )
     insights = build_insights(room_sensors, room_metrics, metrics, pattern)
     dashboard = build_dashboard_payload(room_sensors, appliances)
+    optimization_savings = get_optimization_savings_state(now_epoch)
     return {
         "tariff_inr_per_kwh": TARIFF_PER_KWH,
         "deployment_model": "single-node-raspberry-pi",
@@ -120,6 +123,7 @@ def build_snapshot():
         ),
         "insights": insights,
         "dashboard": dashboard,
+        "optimization_savings": optimization_savings,
         "recent_decisions": get_recent_decision_logs(limit=30),
         "activity_summary": build_recent_activity_summary(limit=4),
 }
@@ -314,6 +318,24 @@ def system_mode():
     snapshot["latest_actions"] = actions
     snapshot["device_message"] = f"Global mode switched to {mode}."
     return jsonify(snapshot)
+
+
+@app.route("/api/optimization-savings", methods=["POST"])
+def optimization_savings():
+    payload = request.get_json(force=True)
+    scope = str(payload.get("scope", "")).strip().lower()
+    if scope not in {"home", "industry"}:
+        return jsonify({"error": f"Unknown optimization savings scope: {scope}"}), 400
+    accrued_tokens = float(payload.get("accrued_tokens", 0.0) or 0.0)
+    rate_per_hour = float(payload.get("rate_per_hour", 0.0) or 0.0)
+    now_epoch = time()
+    save_optimization_savings_state(
+        scope,
+        accrued_tokens=accrued_tokens,
+        rate_per_hour=rate_per_hour,
+        now_epoch=now_epoch,
+    )
+    return jsonify(get_optimization_savings_state(now_epoch))
 
 
 @app.route("/api/room-mode", methods=["POST"])
