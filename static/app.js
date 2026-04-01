@@ -9,6 +9,9 @@ const roomVoiceDebug = new Map();
 const roomVoiceAssist = new Map();
 const latestRooms = new Map();
 const industryRoomElements = new Map();
+const roomOptimizationSessions = new Map();
+const manualOffLocks = new Map();
+const storedRecommendedSetpoints = new Map();
 let latestSnapshotRequestId = 0;
 let latestAppliedSnapshotId = 0;
 let activeRecognition = null;
@@ -29,7 +32,7 @@ const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecogni
 
 const INDUSTRY_ROOM_BLUEPRINTS = [
   { id: "industry_zone_1", name: "Assembly Line 1", template: "living_room", temperature: 32, ambient_light: 42, occupancy: 5 },
-  { id: "industry_zone_2", name: "Assembly Line 2", template: "kitchen", temperature: 31, ambient_light: 48, occupancy: 4 },
+  { id: "industry_zone_2", name: "Assembly Line 2", template: "kitchen", temperature: 31, ambient_light: 48, occupancy: 1 },
   { id: "industry_zone_3", name: "Fabrication Bay", template: "study", temperature: 34, ambient_light: 38, occupancy: 6 },
   { id: "industry_zone_4", name: "Control Room", template: "bedroom", temperature: 28, ambient_light: 56, occupancy: 2 },
   { id: "industry_zone_5", name: "Packaging", template: "living_room", temperature: 30, ambient_light: 44, occupancy: 5 },
@@ -40,12 +43,49 @@ const INDUSTRY_ROOM_BLUEPRINTS = [
   { id: "industry_zone_10", name: "Utility Hub", template: "living_room", temperature: 35, ambient_light: 34, occupancy: 6 },
 ];
 
+const OPTIMIZATION_TARGETS = {
+  living_room: { fan: 54, light: 18 },
+  bedroom: { fan: 42, light: 14 },
+  kitchen: { fan: 58, light: 24 },
+  study: { fan: 0, light: 0 },
+};
+
 function voiceLog(event, payload = {}) {
   console.log(`[smart-home][voice] ${event}`, payload);
 }
 
 function voiceError(event, payload = {}) {
   console.error(`[smart-home][voice] ${event}`, payload);
+}
+
+function deviceStateKey(scope, roomId, deviceKind) {
+  return `${scope}:${roomId}:${deviceKind}`;
+}
+
+function isManualOffLocked(scope, roomId, deviceKind) {
+  return manualOffLocks.get(deviceStateKey(scope, roomId, deviceKind)) === true;
+}
+
+function setManualOffLock(scope, roomId, deviceKind, locked) {
+  const key = deviceStateKey(scope, roomId, deviceKind);
+  if (locked) {
+    manualOffLocks.set(key, true);
+  } else {
+    manualOffLocks.delete(key);
+  }
+}
+
+function getStoredSetpoint(scope, roomId, deviceKind, fallbackValue = 0) {
+  const key = deviceStateKey(scope, roomId, deviceKind);
+  if (storedRecommendedSetpoints.has(key)) {
+    return Number(storedRecommendedSetpoints.get(key) || 0);
+  }
+  return Number(fallbackValue || 0);
+}
+
+function setStoredSetpoint(scope, roomId, deviceKind, value) {
+  const key = deviceStateKey(scope, roomId, deviceKind);
+  storedRecommendedSetpoints.set(key, Math.max(0, Math.min(100, Number(value || 0))));
 }
 
 function assistState(roomId) {
@@ -243,17 +283,31 @@ function buildIndustryState(snapshot) {
     cloned.id = blueprint.id;
     cloned.name = blueprint.name;
     cloned.scope = "industry";
+    cloned.optimization_profile = blueprint.template;
     cloned.sensors.temperature = blueprint.temperature;
     cloned.sensors.ambient_light = blueprint.ambient_light;
     cloned.sensors.occupancy_count = blueprint.occupancy;
     cloned.sensors.occupancy_level = formatOccupancyLevel(blueprint.occupancy);
     cloned.devices.light.id = `${blueprint.id}_light`;
     cloned.devices.fan.id = `${blueprint.id}_fan`;
+    cloned.devices.fan.policy = { ...(cloned.devices.fan.policy || {}), auto_target_percent: 0 };
     cloned.devices.light.brightness = recommendedLightStartupLevel(cloned);
     cloned.devices.light.state = "ON";
     cloned.devices.fan.speed_percent = recommendedFanStartupLevel(cloned);
     cloned.devices.fan.speed = fanBandFromPercent(cloned.devices.fan.speed_percent);
     cloned.devices.fan.state = "ON";
+    if (blueprint.id === "industry_zone_4" || blueprint.id === "industry_zone_7") {
+      cloned.devices.light.brightness = 0;
+      cloned.devices.light.state = "OFF";
+      cloned.devices.fan.speed_percent = 0;
+      cloned.devices.fan.speed = "OFF";
+      cloned.devices.fan.state = "OFF";
+      setManualOffLock("industry", blueprint.id, "light", true);
+      setManualOffLock("industry", blueprint.id, "fan", true);
+    } else {
+      setManualOffLock("industry", blueprint.id, "light", false);
+      setManualOffLock("industry", blueprint.id, "fan", false);
+    }
     rooms[blueprint.id] = cloned;
   });
   return {
@@ -352,6 +406,12 @@ function buildRoomCard(room, options = {}) {
   root.className = "room-card";
   root.dataset.roomId = room.id;
   root.dataset.scope = options.scope || "home";
+  const voiceControls = options.voiceEnabled === false
+    ? ""
+    : `
+        <button class="mic-button speaker-button" type="button" data-room-id="${room.id}" data-voice-kind="speaker" id="voice-speaker-${room.id}" aria-label="Start voice assist for ${room.name}">🔊</button>
+        <button class="mic-button" type="button" data-room-id="${room.id}" data-voice-kind="mic" id="voice-mic-${room.id}" aria-label="Speak a command for ${room.name}">🎙</button>
+      `;
   root.innerHTML = `
     <div class="room-header">
       <div class="room-title">
@@ -359,8 +419,8 @@ function buildRoomCard(room, options = {}) {
       </div>
       <div class="room-actions">
         <span class="room-badge" id="room-badge-${room.id}"></span>
-        <button class="mic-button speaker-button" type="button" data-room-id="${room.id}" data-voice-kind="speaker" id="voice-speaker-${room.id}" aria-label="Start voice assist for ${room.name}">🔊</button>
-        <button class="mic-button" type="button" data-room-id="${room.id}" data-voice-kind="mic" id="voice-mic-${room.id}" aria-label="Speak a command for ${room.name}">🎙</button>
+        ${voiceControls}
+        <button class="sensor-chip optimize-chip" type="button" data-room-id="${room.id}" data-optimize-room="true" aria-label="Run power optimization for ${room.name}">⚡ Power optimization</button>
         <details class="sensor-popover" id="sensor-popover-${room.id}">
           <summary class="sensor-chip">Sensors</summary>
           <div class="sensor-flyout sensor-panel compact">
@@ -369,7 +429,7 @@ function buildRoomCard(room, options = {}) {
             <div class="stepper-field">
               <div class="slider-head">
                 <span>Occupancy</span>
-                <strong id="sensor-value-${room.id}-occupancy_count">0 persons</strong>
+                <strong id="sensor-value-${room.id}-occupancy_count">0</strong>
               </div>
               <div class="occupancy-stepper">
                 <button type="button" class="stepper-button" data-room-id="${room.id}" data-occupancy-step="-1">-</button>
@@ -385,6 +445,15 @@ function buildRoomCard(room, options = {}) {
       <div class="scene-haze"></div>
       <div class="light-pool"></div>
       <div class="scene-decor" id="scene-decor-${room.id}"></div>
+      <div class="sensor-hud" id="sensor-hud-${room.id}" aria-label="Live sensor readings">
+        <span class="sensor-hud-item" id="hud-temperature-${room.id}">🌡️ 0 °C</span>
+        <span class="sensor-hud-item" id="hud-light-${room.id}">💡 0%</span>
+      </div>
+      <div class="room-overlay" id="room-overlay-${room.id}" hidden>
+        <div class="room-overlay-card">
+          <strong id="room-overlay-title-${room.id}">Optimizing...</strong>
+        </div>
+      </div>
       <div class="fan" id="fan-wrap-${room.id}">
         <div class="fan-rotor" id="fan-rotor-${room.id}">
           <span class="fan-blade"></span>
@@ -400,7 +469,7 @@ function buildRoomCard(room, options = {}) {
         <span class="metric-pill"><span>Bill</span><strong id="room-cost-${room.id}">₹0.00</strong></span>
         <span class="metric-pill"><span>Occupancy</span><strong id="occupancy-label-${room.id}">Absent</strong></span>
       </div>
-      <div class="voice-note" id="voice-status-${room.id}">Voice idle.</div>
+      <div class="voice-note" id="voice-status-${room.id}"></div>
       <div class="control-deck">
         <div class="hud-module">
           <div class="hud-meta">
@@ -445,6 +514,9 @@ function buildRoomCard(room, options = {}) {
     badge: root.querySelector(`#room-badge-${room.id}`),
     voiceStatus: root.querySelector(`#voice-status-${room.id}`),
     sensorPopover: root.querySelector(`#sensor-popover-${room.id}`),
+    optimizeButton: root.querySelector(`[data-room-id="${room.id}"][data-optimize-room="true"]`),
+    overlay: root.querySelector(`#room-overlay-${room.id}`),
+    overlayTitle: root.querySelector(`#room-overlay-title-${room.id}`),
     speakerButton: root.querySelector(`#voice-speaker-${room.id}`),
     micButton: root.querySelector(`#voice-mic-${room.id}`),
     fanRotor: root.querySelector(`#fan-rotor-${room.id}`),
@@ -452,9 +524,13 @@ function buildRoomCard(room, options = {}) {
     fanStatus: root.querySelector(`#fan-status-${room.id}`),
     lightToggle: root.querySelector(`#light-toggle-${room.id}`),
     fanToggle: root.querySelector(`#fan-toggle-${room.id}`),
+    lightSlider: root.querySelector(`[data-room-id="${room.id}"][data-device-kind="light"]`),
+    fanSlider: root.querySelector(`[data-room-id="${room.id}"][data-device-kind="fan"]`),
     occupancyLabel: root.querySelector(`#occupancy-label-${room.id}`),
     roomPower: root.querySelector(`#room-power-${room.id}`),
     roomCost: root.querySelector(`#room-cost-${room.id}`),
+    hudTemperature: root.querySelector(`#hud-temperature-${room.id}`),
+    hudLight: root.querySelector(`#hud-light-${room.id}`),
     leds: [...root.querySelectorAll(`[id^="room-led-${room.id}-"]`)],
     occupancyDown: root.querySelector(`[data-room-id="${room.id}"][data-occupancy-step="-1"]`),
     occupancyUp: root.querySelector(`[data-room-id="${room.id}"][data-occupancy-step="1"]`),
@@ -487,65 +563,116 @@ function deviceSlider(roomId, deviceId, kind, key, label, suffix) {
 
 function updateRoomCard(card, room) {
   latestRooms.set(room.id, room);
-  const light = room.devices.light;
-  const fan = room.devices.fan;
+  const optimizationSession = roomOptimizationSessions.get(`${card.scope}:${room.id}`);
+  const lightOffLocked = isManualOffLocked(card.scope, room.id, "light");
+  const fanOffLocked = isManualOffLocked(card.scope, room.id, "fan");
+  const light = optimizationSession
+    ? {
+        ...room.devices.light,
+        state: optimizationSession.lightOn ? "ON" : "OFF",
+        brightness: optimizationSession.lightPercent,
+      }
+    : room.devices.light;
+  const fan = optimizationSession
+    ? {
+        ...room.devices.fan,
+        state: optimizationSession.fanOn ? "ON" : "OFF",
+        speed_percent: optimizationSession.fanPercent,
+        speed: fanBandFromPercent(optimizationSession.fanPercent),
+      }
+    : room.devices.fan;
+  const effectiveLight = lightOffLocked && !optimizationSession
+    ? {
+        ...light,
+        state: "OFF",
+        brightness: 0,
+      }
+    : light;
+  const effectiveFan = fanOffLocked && !optimizationSession
+    ? {
+        ...fan,
+        state: "OFF",
+        speed_percent: 0,
+        speed: "OFF",
+      }
+    : fan;
+  setStoredSetpoint(card.scope, room.id, "fan", recommendedFanStartupLevel(room));
+  setStoredSetpoint(card.scope, room.id, "light", recommendedLightStartupLevel(room));
   const sensors = room.sensors;
-  const lightOn = light.state === "ON";
-  const glow = hexToRgba(light.color, Math.max(0.16, light.brightness / 100));
-  const glowSoft = hexToRgba(light.color, Math.max(0.1, light.brightness / 260));
-  const fanOn = Number(fan.speed_percent) > 0;
-  const fanSwitchOn = fan.state === "ON";
-  const fanPolicy = fan.policy || {};
+  const lightOn = effectiveLight.state === "ON";
+  const glow = hexToRgba(effectiveLight.color, Math.max(0.16, effectiveLight.brightness / 100));
+  const glowSoft = hexToRgba(effectiveLight.color, Math.max(0.1, effectiveLight.brightness / 260));
+  const fanOn = Number(effectiveFan.speed_percent) > 0;
+  const fanSwitchOn = effectiveFan.state === "ON";
+  const fanPolicy = effectiveFan.policy || {};
   const fanModeLabel = formatPolicyState(fanPolicy.state);
-  const voiceFeedback = roomVoiceFeedback.get(room.id) || "Tap mic and speak for this room.";
+  const voiceFeedback = roomVoiceFeedback.get(room.id) || "";
   const voiceDebug = roomVoiceDebug.get(room.id) || "No voice activity yet.";
   const speakerState = assistState(room.id);
+  const optimizing = !!optimizationSession;
 
   card.name.textContent = room.name;
-  card.badge.textContent = lightOn || fanSwitchOn ? "Live" : "Idle";
+  const isLive = lightOn || fanSwitchOn;
+  card.badge.textContent = isLive ? "Live" : "Idle";
+  card.badge.classList.toggle("is-live", isLive);
+  card.badge.classList.toggle("is-idle", !isLive);
   card.voiceStatus.textContent = voiceFeedback;
   if (card.voiceDebug) {
     card.voiceDebug.textContent = voiceDebug;
   }
-  card.speakerButton.classList.toggle(
-    "listening",
-    speakerState === "awaiting_reply" || speakerState === "capturing_reply"
-  );
-  card.speakerButton.classList.toggle(
-    "processing",
-    speakerState === "loading" || speakerState === "replying"
-  );
-  card.micButton.classList.toggle("listening", activeListeningRoomId === room.id);
-  card.micButton.classList.toggle("processing", activeCommandProcessingRoomId === room.id);
-  card.speakerButton.disabled = !card.voiceEnabled;
-  card.micButton.disabled = !card.voiceEnabled || !SpeechRecognition;
-  card.speakerButton.hidden = !card.voiceEnabled;
-  card.micButton.hidden = !card.voiceEnabled;
-  card.micButton.textContent =
-    activeCommandProcessingRoomId === room.id
-      ? "…"
-      : activeListeningRoomId === room.id
-        ? "◉"
-        : "🎙";
-  card.speakerButton.textContent =
-    speakerState === "loading" || speakerState === "replying"
-      ? "…"
-      : speakerState === "awaiting_reply" || speakerState === "capturing_reply"
-        ? "◉"
-        : "🔊";
+  if (card.speakerButton) {
+    card.speakerButton.classList.toggle(
+      "listening",
+      speakerState === "awaiting_reply" || speakerState === "capturing_reply"
+    );
+    card.speakerButton.classList.toggle(
+      "processing",
+      speakerState === "loading" || speakerState === "replying"
+    );
+    card.speakerButton.disabled = !card.voiceEnabled;
+    card.speakerButton.hidden = !card.voiceEnabled;
+    card.speakerButton.textContent =
+      speakerState === "loading" || speakerState === "replying"
+        ? "…"
+        : speakerState === "awaiting_reply" || speakerState === "capturing_reply"
+          ? "◉"
+          : "🔊";
+  }
+  if (card.micButton) {
+    card.micButton.classList.toggle("listening", activeListeningRoomId === room.id);
+    card.micButton.classList.toggle("processing", activeCommandProcessingRoomId === room.id);
+    card.micButton.disabled = !card.voiceEnabled || !SpeechRecognition;
+    card.micButton.hidden = !card.voiceEnabled;
+    card.micButton.textContent =
+      activeCommandProcessingRoomId === room.id
+        ? "…"
+        : activeListeningRoomId === room.id
+          ? "◉"
+          : "🎙";
+  }
+  if (card.optimizeButton) {
+    card.optimizeButton.disabled = optimizing;
+  }
   card.root.classList.toggle("light-on", lightOn);
   card.root.style.setProperty("--light-color", light.color);
   card.root.style.setProperty("--room-glow", glow);
   card.root.style.setProperty("--room-glow-soft", glowSoft);
   card.root.style.setProperty("--fan-left", room.layout.fan_position.x);
   card.root.style.setProperty("--fan-top", room.layout.fan_position.y);
+  if (optimizationSession) {
+    setRoomOverlay(card, optimizationSession.title || "Optimizing...", true);
+  } else {
+    setRoomOverlay(card, "", false);
+  }
 
-  card.lightStatus.textContent = `${light.brightness}%`;
-  const fanSpeedLabel = fanSwitchOn && Number(fan.speed_percent) === 0 ? "Armed" : fan.speed;
+  card.lightStatus.textContent = `${effectiveLight.brightness}%`;
+  const fanSpeedLabel = fanSwitchOn && Number(effectiveFan.speed_percent) === 0 ? "Armed" : effectiveFan.speed;
   card.fanStatus.textContent = fanModeLabel
-    ? `${fan.speed_percent}% · ${fanModeLabel}`
-    : `${fan.speed_percent}%`;
+    ? `${effectiveFan.speed_percent}% · ${fanModeLabel}`
+    : `${effectiveFan.speed_percent}%`;
   card.occupancyLabel.textContent = `${room.sensors.occupancy_level} (${room.sensors.occupancy_count})`;
+  card.hudTemperature.textContent = `🌡️ ${Math.round(Number(sensors.temperature || 0))} °C`;
+  card.hudLight.textContent = `💡 ${Math.round(Number(sensors.ambient_light || 0))}%`;
   const occupancyStepper = card.root.querySelector(`#occupancy-stepper-${room.id}`);
   if (occupancyStepper) {
     occupancyStepper.textContent = String(room.sensors.occupancy_count);
@@ -560,11 +687,15 @@ function updateRoomCard(card, room) {
   primeLiveMeter(card.roomCost, Number(room.metrics.billing_tokens || 0), Number(room.metrics.rate_tokens || 0), " tok");
 
   card.lightToggle.classList.toggle("on", lightOn);
-  card.lightToggle.dataset.level = lightOn ? "0" : String(explicitLightToggleLevel(room));
+  card.lightToggle.dataset.level = lightOn
+    ? "0"
+    : String(getStoredSetpoint(card.scope, room.id, "light", explicitLightToggleLevel(room)));
   card.lightToggle.disabled = false;
 
   card.fanToggle.classList.toggle("on", fanSwitchOn);
-  card.fanToggle.dataset.level = fanSwitchOn ? "0" : String(recommendedFanStartupLevel(room));
+  card.fanToggle.dataset.level = fanSwitchOn
+    ? "0"
+    : String(getStoredSetpoint(card.scope, room.id, "fan", recommendedFanStartupLevel(room)));
   card.fanToggle.dataset.resume = fanSwitchOn ? "false" : "true";
   card.fanToggle.disabled = false;
 
@@ -572,23 +703,46 @@ function updateRoomCard(card, room) {
   updateSlider(card.root, room.id, "ambient_light", sensors.ambient_light, "%", false);
   const occupancyValue = card.root.querySelector(`#sensor-value-${room.id}-occupancy_count`);
   if (occupancyValue) {
-    occupancyValue.textContent = `${Math.round(Number(sensors.occupancy_count))} persons`;
+    occupancyValue.textContent = `${Math.round(Number(sensors.occupancy_count))}`;
   }
-  updateSlider(card.root, room.id, "light", light.brightness, "%", !lightOn, true, {
-    animate: true,
-  });
-  updateSlider(card.root, room.id, "fan", fan.speed_percent, "%", false, true, {
-    animate: true,
-    onFrame: (animatedValue) => {
-      card.fanRotor.style.animationDuration = fanDuration(animatedValue);
-    },
-  });
+  if (optimizationSession) {
+    if (card.lightSlider) {
+      stopSliderAnimation(card.lightSlider);
+      card.lightSlider.dataset.userAdjusting = "false";
+      card.lightSlider.dataset.syncPending = "false";
+      card.lightSlider.value = String(Math.round(Number(effectiveLight.brightness || 0)));
+      const lightValueNode = card.root.querySelector(`#device-value-${room.id}-light`);
+      if (lightValueNode) {
+        lightValueNode.textContent = `${Math.round(Number(effectiveLight.brightness || 0))}%`;
+      }
+    }
+    if (card.fanSlider) {
+      stopSliderAnimation(card.fanSlider);
+      card.fanSlider.dataset.userAdjusting = "false";
+      card.fanSlider.dataset.syncPending = "false";
+      card.fanSlider.value = String(Math.round(Number(effectiveFan.speed_percent || 0)));
+      const fanValueNode = card.root.querySelector(`#device-value-${room.id}-fan`);
+      if (fanValueNode) {
+        fanValueNode.textContent = `${Math.round(Number(effectiveFan.speed_percent || 0))}%`;
+      }
+    }
+  } else {
+    updateSlider(card.root, room.id, "light", effectiveLight.brightness, "%", !lightOn, true, {
+      animate: true,
+    });
+    updateSlider(card.root, room.id, "fan", effectiveFan.speed_percent, "%", false, true, {
+      animate: true,
+      onFrame: (animatedValue) => {
+        card.fanRotor.style.animationDuration = fanDuration(animatedValue);
+      },
+    });
+  }
 
   card.fanRotor.style.animationPlayState = fanOn ? "running" : "paused";
 
   card.leds.forEach((led) => {
     led.classList.toggle("on", lightOn);
-    led.style.opacity = lightOn ? String(Math.max(0.35, light.brightness / 100)) : "0.55";
+    led.style.opacity = lightOn ? String(Math.max(0.35, effectiveLight.brightness / 100)) : "0.55";
   });
 }
 
@@ -798,56 +952,18 @@ function fanDuration(level) {
 }
 
 function recommendedFanStartupLevel(room) {
+  if (room.scope === "industry") {
+    return optimizedTargetsForRoom(room).fan;
+  }
   const policyTarget = Number(room.devices.fan.policy?.auto_target_percent || 0);
   if (policyTarget > 0) {
     return Math.round(policyTarget);
   }
-  const temperature = Number(room.sensors.temperature || 0);
-  const occupancy = Number(room.sensors.occupancy_count || 0);
-  if (occupancy <= 0) {
-    if (temperature >= 38) return 84;
-    if (temperature >= 34) return 58;
-    if (temperature >= 30) return 28;
-    if (temperature >= 22) return 18;
-    return 0;
-  }
-  const peopleBoost = Math.max(0, occupancy - 1) * 4;
-  if (temperature >= 40) return Math.min(100, 95 + peopleBoost);
-  if (temperature >= 36) return Math.min(100, 82 + peopleBoost);
-  if (temperature >= 32) return Math.min(96, 64 + peopleBoost);
-  if (temperature >= 28) return Math.min(88, 42 + peopleBoost);
-  return Math.max(22, 22 + peopleBoost);
+  return optimizedTargetsForRoom(room).fan;
 }
 
 function recommendedLightStartupLevel(room) {
-  const occupancy = Number(room.sensors.occupancy_count || 0);
-  const ambientLight = Number(room.sensors.ambient_light || 0);
-  const points = occupancy <= 0
-    ? [
-        [0, 22],
-        [20, 18],
-        [45, 12],
-        [75, 6],
-        [100, 0],
-      ]
-    : [
-        [0, 85],
-        [20, 65],
-        [45, 35],
-        [75, 18],
-        [100, 12],
-      ];
-  if (ambientLight <= points[0][0]) return points[0][1];
-  if (ambientLight >= points[points.length - 1][0]) return points[points.length - 1][1];
-  for (let index = 1; index < points.length; index += 1) {
-    const [leftX, leftY] = points[index - 1];
-    const [rightX, rightY] = points[index];
-    if (ambientLight <= rightX) {
-      const progress = (ambientLight - leftX) / (rightX - leftX);
-      return Math.max(0, Math.round(leftY + (rightY - leftY) * progress));
-    }
-  }
-  return 0;
+  return optimizedTargetsForRoom(room).light;
 }
 
 function explicitLightToggleLevel(room) {
@@ -970,6 +1086,7 @@ function previewMetricsForRoom(roomId, overrides = {}) {
   if (!latestSnapshot || !latestRooms.has(roomId)) {
     return;
   }
+  const scope = "home";
   const tariff = Number(latestSnapshot.tariff_inr_per_kwh || 8);
   const projectedRooms = {};
   Object.entries(latestSnapshot.rooms).forEach(([id, room]) => {
@@ -1010,20 +1127,28 @@ function previewMetricsForRoom(roomId, overrides = {}) {
   );
   const fanHeld = targetRoom.devices.fan.policy?.state === "hold";
   const lightHeld = targetRoom.devices.light.policy?.state === "hold";
+  const fanOffLocked = isManualOffLocked(scope, roomId, "fan");
+  const lightOffLocked = isManualOffLocked(scope, roomId, "light");
   const card = roomElements.get(roomId);
   if (fanSensorPreview && !fanHeld) {
     const predictedFan = recommendedFanStartupLevel(targetRoom);
-    targetRoom.devices.fan.speed_percent = predictedFan;
-    targetRoom.devices.fan.state = "ON";
-    if (card) {
+    setStoredSetpoint(scope, roomId, "fan", predictedFan);
+    if (!fanOffLocked) {
+      targetRoom.devices.fan.speed_percent = predictedFan;
+      targetRoom.devices.fan.state = "ON";
+    }
+    if (card && !fanOffLocked) {
       applyFanVisualPreview(card, predictedFan, true);
     }
   }
   if (lightSensorPreview && !lightHeld) {
     const predictedLight = recommendedLightStartupLevel(targetRoom);
-    targetRoom.devices.light.brightness = predictedLight;
-    targetRoom.devices.light.state = predictedLight > 0 ? "ON" : "ON";
-    if (card) {
+    setStoredSetpoint(scope, roomId, "light", predictedLight);
+    if (!lightOffLocked) {
+      targetRoom.devices.light.brightness = predictedLight;
+      targetRoom.devices.light.state = "ON";
+    }
+    if (card && !lightOffLocked) {
       applyLightVisualPreview(card, predictedLight, true);
     }
   }
@@ -1086,19 +1211,308 @@ function tickLiveTokenMeters() {
   }
 }
 
-function applyIndustrySensorResponse(room) {
-  const predictedFan = recommendedFanStartupLevel(room);
-  room.devices.fan.speed_percent = predictedFan;
-  room.devices.fan.state = "ON";
-  room.devices.fan.speed = fanBandFromPercent(predictedFan);
+function applyIndustrySensorResponse(room, changedSensorKey = "occupancy_count") {
+  const shouldUpdateFan = changedSensorKey === "temperature" || changedSensorKey === "occupancy_count";
+  const shouldUpdateLight = changedSensorKey === "ambient_light" || changedSensorKey === "occupancy_count";
 
-  const predictedLight = recommendedLightStartupLevel(room);
-  room.devices.light.brightness = predictedLight;
-  room.devices.light.state = "ON";
+  if (shouldUpdateFan) {
+    const predictedFan = recommendedFanStartupLevel(room);
+    setStoredSetpoint("industry", room.id, "fan", predictedFan);
+    if (!isManualOffLocked("industry", room.id, "fan")) {
+      room.devices.fan.speed_percent = predictedFan;
+      room.devices.fan.state = "ON";
+      room.devices.fan.speed = fanBandFromPercent(predictedFan);
+    }
+  }
+
+  if (shouldUpdateLight) {
+    const predictedLight = recommendedLightStartupLevel(room);
+    setStoredSetpoint("industry", room.id, "light", predictedLight);
+    if (!isManualOffLocked("industry", room.id, "light")) {
+      room.devices.light.brightness = predictedLight;
+      room.devices.light.state = "ON";
+    }
+  }
 }
 
 function explicitIndustryLightLevel(room) {
   return Math.max(18, recommendedLightStartupLevel(room));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function roomProfileKey(room) {
+  return room.optimization_profile || room.id || "living_room";
+}
+
+function clampTarget(value) {
+  return Math.max(0, Math.min(100, Math.round(Number(value || 0))));
+}
+
+function optimizedTargetsForRoom(room) {
+  const occupancy = Number(room.sensors.occupancy_count || 0);
+  const temperature = Number(room.sensors.temperature || 0);
+  const ambientLight = Number(room.sensors.ambient_light || 0);
+  const occupied = occupancy > 0;
+  const currentFan = Number(room.devices.fan.speed_percent || 0);
+  const currentLight = Number(room.devices.light.brightness || 0);
+  let fanTarget = 0;
+  let lightTarget = 0;
+
+  if (occupied) {
+    const occupancyBoost = occupancy >= 6 ? 16 : occupancy >= 4 ? 12 : occupancy >= 2 ? 8 : 3;
+    if (temperature >= 39) fanTarget = 86 + occupancyBoost;
+    else if (temperature >= 35) fanTarget = 72 + occupancyBoost;
+    else if (temperature >= 32) fanTarget = 58 + occupancyBoost;
+    else if (temperature >= 29) fanTarget = 46 + occupancyBoost;
+    else if (temperature >= 26) fanTarget = 34 + occupancyBoost;
+    else if (temperature >= 23) fanTarget = 24 + Math.round(occupancyBoost * 0.75);
+    else fanTarget = 18 + Math.round(occupancyBoost * 0.5);
+
+    if (ambientLight <= 12) lightTarget = 74 + occupancyBoost;
+    else if (ambientLight <= 25) lightTarget = 58 + occupancyBoost;
+    else if (ambientLight <= 42) lightTarget = 42 + Math.round(occupancyBoost * 0.8);
+    else if (ambientLight <= 60) lightTarget = 24 + Math.round(occupancyBoost * 0.6);
+    else lightTarget = 12 + Math.round(occupancyBoost * 0.4);
+  } else {
+    if (temperature >= 38) fanTarget = 34;
+    else if (temperature >= 34) fanTarget = 24;
+    else if (temperature >= 30) fanTarget = 16;
+    else fanTarget = 0;
+
+    if (ambientLight <= 16) lightTarget = 14;
+    else if (ambientLight <= 28) lightTarget = 8;
+    else lightTarget = 0;
+  }
+
+  // Optimization should visibly trim excessive outputs instead of looking like a no-op.
+  if (currentFan > 0 && currentFan - fanTarget < 8 && currentFan >= 32) {
+    fanTarget = Math.max(occupied ? 22 : 0, currentFan - (currentFan >= 70 ? 14 : 10));
+  }
+  if (currentLight > 0 && currentLight - lightTarget < 8 && currentLight >= 24) {
+    lightTarget = Math.max(occupied ? 12 : 0, currentLight - (currentLight >= 60 ? 16 : 10));
+  }
+
+  return {
+    fan: clampTarget(fanTarget),
+    light: clampTarget(lightTarget),
+  };
+}
+
+function setRoomOverlay(card, title, visible) {
+  if (!card?.overlay || !card?.overlayTitle) {
+    return;
+  }
+  card.overlayTitle.textContent = title;
+  card.overlay.hidden = !visible;
+  card.overlay.classList.toggle("visible", visible);
+  card.root.classList.toggle("optimizing", visible);
+}
+
+function updateOptimizationSession(key, next) {
+  const current = roomOptimizationSessions.get(key) || {};
+  roomOptimizationSessions.set(key, { ...current, ...next });
+}
+
+function easeSequence(fromValue, toValue, steps = 16) {
+  const points = [];
+  for (let index = 1; index <= steps; index += 1) {
+    const progress = index / steps;
+    const eased = progress < 0.5
+      ? 2 * progress * progress
+      : 1 - Math.pow(-2 * progress + 2, 2) / 2;
+    points.push(Math.round(fromValue + (toValue - fromValue) * eased));
+  }
+  return points;
+}
+
+function optimizationStepDelay(index, steps) {
+  const progress = index / Math.max(1, steps - 1);
+  return 140 + Math.round((1 - progress) * 120);
+}
+
+function seededOptimizationStart(currentValue, targetValue) {
+  if (currentValue > 0 || targetValue <= 0) {
+    return currentValue;
+  }
+  if (targetValue >= 55) {
+    return 18;
+  }
+  if (targetValue >= 28) {
+    return 12;
+  }
+  return 8;
+}
+
+function driveOptimizationVisual(card, roomId, fanPercent, lightPercent, fanOn, lightOn) {
+  if (card.fanSlider) {
+    stopSliderAnimation(card.fanSlider);
+    card.fanSlider.dataset.userAdjusting = "false";
+    card.fanSlider.dataset.syncPending = "false";
+    card.fanSlider.value = String(Math.round(Number(fanPercent || 0)));
+    const fanValueNode = card.root.querySelector(`#device-value-${roomId}-fan`);
+    if (fanValueNode) {
+      fanValueNode.textContent = `${Math.round(Number(fanPercent || 0))}%`;
+    }
+  }
+  if (card.lightSlider) {
+    stopSliderAnimation(card.lightSlider);
+    card.lightSlider.dataset.userAdjusting = "false";
+    card.lightSlider.dataset.syncPending = "false";
+    card.lightSlider.value = String(Math.round(Number(lightPercent || 0)));
+    const lightValueNode = card.root.querySelector(`#device-value-${roomId}-light`);
+    if (lightValueNode) {
+      lightValueNode.textContent = `${Math.round(Number(lightPercent || 0))}%`;
+    }
+  }
+  applyFanVisualPreview(card, fanPercent, fanOn);
+  applyLightVisualPreview(card, lightPercent, lightOn);
+}
+
+async function animateHomeOptimization(roomId, card, room, targets) {
+  const key = `${card.scope}:${roomId}`;
+  const currentFan = seededOptimizationStart(Number(room.devices.fan.speed_percent || 0), targets.fan);
+  const currentLight = seededOptimizationStart(Number(room.devices.light.brightness || 0), targets.light);
+  const fanFrames = easeSequence(currentFan, targets.fan, 16);
+  const lightFrames = easeSequence(currentLight, targets.light, 16);
+  const frameCount = Math.max(fanFrames.length, lightFrames.length);
+  updateOptimizationSession(key, {
+    title: "Analyzing previous trends...",
+    fanPercent: currentFan,
+    lightPercent: currentLight,
+    fanOn: currentFan > 0,
+    lightOn: currentLight > 0,
+  });
+  driveOptimizationVisual(card, roomId, currentFan, currentLight, currentFan > 0, currentLight > 0);
+  updateRoomCard(card, room);
+  await sleep(650);
+  updateOptimizationSession(key, { title: "Optimizing..." });
+  for (let index = 0; index < frameCount; index += 1) {
+    const nextFan = fanFrames[Math.min(index, fanFrames.length - 1)];
+    const nextLight = lightFrames[Math.min(index, lightFrames.length - 1)];
+    updateOptimizationSession(key, {
+      title: "Optimizing...",
+      fanPercent: nextFan,
+      lightPercent: nextLight,
+      fanOn: targets.fan > 0,
+      lightOn: targets.light > 0,
+    });
+    driveOptimizationVisual(card, roomId, nextFan, nextLight, targets.fan > 0, targets.light > 0);
+    updateRoomCard(card, room);
+    previewMetricsForRoom(roomId, {
+      fan_speed_percent: nextFan,
+      fan_state: targets.fan > 0 ? "ON" : "OFF",
+      light_brightness: nextLight,
+      light_state: targets.light > 0 ? "ON" : "OFF",
+    });
+    await sleep(optimizationStepDelay(index, frameCount));
+  }
+  if (targets.fan > 0) {
+    await applyDeviceControl(room.devices.fan.id, targets.fan, { preserve_on_zero: false });
+  } else {
+    await applyDeviceControl(room.devices.fan.id, 0, { preserve_on_zero: false });
+  }
+  if (targets.light > 0) {
+    await applyDeviceControl(room.devices.light.id, targets.light, { preserve_on_zero: false });
+  } else {
+    await applyDeviceControl(room.devices.light.id, 0, { preserve_on_zero: false });
+  }
+}
+
+async function animateIndustryOptimization(roomId, card, room, targets) {
+  const key = `${card.scope}:${roomId}`;
+  const currentFan = seededOptimizationStart(Number(room.devices.fan.speed_percent || 0), targets.fan);
+  const currentLight = seededOptimizationStart(Number(room.devices.light.brightness || 0), targets.light);
+  const fanFrames = easeSequence(currentFan, targets.fan, 16);
+  const lightFrames = easeSequence(currentLight, targets.light, 16);
+  const frameCount = Math.max(fanFrames.length, lightFrames.length);
+  updateOptimizationSession(key, {
+    title: "Analyzing previous trends...",
+    fanPercent: currentFan,
+    lightPercent: currentLight,
+    fanOn: currentFan > 0,
+    lightOn: currentLight > 0,
+  });
+  driveOptimizationVisual(card, roomId, currentFan, currentLight, currentFan > 0, currentLight > 0);
+  updateRoomCard(card, room);
+  await sleep(650);
+  updateOptimizationSession(key, { title: "Optimizing..." });
+  for (let index = 0; index < frameCount; index += 1) {
+    const nextFan = fanFrames[Math.min(index, fanFrames.length - 1)];
+    const nextLight = lightFrames[Math.min(index, lightFrames.length - 1)];
+    updateOptimizationSession(key, {
+      title: "Optimizing...",
+      fanPercent: nextFan,
+      lightPercent: nextLight,
+      fanOn: targets.fan > 0,
+      lightOn: targets.light > 0,
+    });
+    driveOptimizationVisual(card, roomId, nextFan, nextLight, targets.fan > 0, targets.light > 0);
+    updateIndustryRoom(roomId, (targetRoom) => {
+      targetRoom.devices.fan.state = targets.fan > 0 ? "ON" : "OFF";
+      targetRoom.devices.fan.speed_percent = nextFan;
+      targetRoom.devices.fan.speed = fanBandFromPercent(nextFan);
+      targetRoom.devices.light.state = targets.light > 0 ? "ON" : "OFF";
+      targetRoom.devices.light.brightness = nextLight;
+    });
+    await sleep(optimizationStepDelay(index, frameCount));
+  }
+}
+
+async function startRoomOptimization(roomId, scope) {
+  const key = `${scope}:${roomId}`;
+  if (roomOptimizationSessions.has(key)) {
+    return;
+  }
+  const elementMap = scope === "industry" ? industryRoomElements : roomElements;
+  const initialCard = elementMap.get(roomId);
+  if (!initialCard) {
+    return;
+  }
+  if (scope === "home") {
+    await flushPendingRoomSensorSync(roomId, initialCard.root);
+  }
+  const baseRoom = scope === "industry" ? latestIndustryState?.rooms?.[roomId] : latestSnapshot?.rooms?.[roomId];
+  cancelPendingRoomDeviceSync(baseRoom);
+  const card = elementMap.get(roomId);
+  const room = roomWithLiveInputs(baseRoom, card?.root || initialCard.root);
+  if (!room) {
+    return;
+  }
+  roomOptimizationSessions.set(key, {
+    title: "Optimizing...",
+    fanPercent: Number(room.devices.fan.speed_percent || 0),
+    lightPercent: Number(room.devices.light.brightness || 0),
+    fanOn: room.devices.fan.state === "ON",
+    lightOn: room.devices.light.state === "ON",
+  });
+  updateRoomCard(card, room);
+  const targets = optimizedTargetsForRoom(room);
+  try {
+    if (scope === "industry") {
+      await animateIndustryOptimization(roomId, card, room, targets);
+    } else {
+      await animateHomeOptimization(roomId, card, room, targets);
+    }
+    updateOptimizationSession(key, {
+      title: "Complete",
+      fanPercent: targets.fan,
+      lightPercent: targets.light,
+      fanOn: targets.fan > 0,
+      lightOn: targets.light > 0,
+    });
+    updateRoomCard(card, room);
+    await sleep(1000);
+  } finally {
+    roomOptimizationSessions.delete(key);
+    if (scope === "industry") {
+      renderIndustrySnapshot();
+    } else if (latestSnapshot?.rooms?.[roomId]) {
+      updateRoomCard(card, latestSnapshot.rooms[roomId]);
+    }
+  }
 }
 
 function formatOccupancyLevel(count) {
@@ -1152,37 +1566,59 @@ function buildDashboardPreview(rooms, roomMetrics, globalMetrics) {
 function buildTrendSeries(window, comparison, totalRateTokens, totalPowerTokens) {
   const topRooms = comparison.slice(0, 3);
   const roomWeight = topRooms.length
-    ? topRooms.reduce((sum, item) => sum + item.occupancy_score + (item.avg_fan_percent / 50) + (item.avg_light_percent / 60), 0) / topRooms.length
+    ? topRooms.reduce((sum, item) => sum + item.occupancy_score + (item.avg_fan_percent / 45) + (item.avg_light_percent / 55), 0) / topRooms.length
     : 1;
   const baseRate = Math.max(40, totalRateTokens || 40);
   const basePower = Math.max(30, totalPowerTokens || 30);
+  const heatBias = topRooms.length
+    ? topRooms.reduce((sum, item) => sum + item.avg_fan_percent, 0) / (topRooms.length * 100)
+    : 0.35;
+  const lightBias = topRooms.length
+    ? topRooms.reduce((sum, item) => sum + item.avg_light_percent, 0) / (topRooms.length * 100)
+    : 0.3;
+  const occupancyBias = topRooms.length
+    ? topRooms.reduce((sum, item) => sum + item.occupancy_score, 0) / (topRooms.length * 5)
+    : 0.4;
   const shapes = {
     hourly: {
-      labels: ["06:00", "09:00", "12:00", "15:00", "18:00", "21:00", "23:00"],
-      multipliers: [0.42, 0.68, 0.58, 0.74, 1.0, 0.88, 0.54],
+      labels: ["00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00"],
+      multipliers: [0.24, 0.18, 0.36, 0.62, 0.78, 0.7, 1.0, 0.66],
       subtitle: "Live room behavior across the day",
+      scale: 1.0,
+      offset: 0,
     },
     daily: {
-      labels: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-      multipliers: [0.76, 0.82, 0.78, 0.9, 0.96, 1.08, 0.88],
+      labels: ["Day 1", "Day 2", "Day 3", "Day 4", "Day 5", "Day 6", "Day 7"],
+      multipliers: [0.64, 0.7, 0.74, 0.82, 0.9, 1.06, 0.86],
       subtitle: "Daily load and billing progression",
+      scale: 3.1,
+      offset: 0.08,
     },
     weekly: {
-      labels: ["W1", "W2", "W3", "W4", "W5", "W6"],
-      multipliers: [0.82, 0.86, 0.92, 0.98, 1.06, 1.02],
+      labels: ["Week 1", "Week 2", "Week 3", "Week 4", "Week 5", "Week 6"],
+      multipliers: [0.54, 0.68, 0.74, 0.88, 1.04, 0.96],
       subtitle: "Weekly optimization and usage drift",
+      scale: 7.4,
+      offset: 0.16,
     },
   };
   const selected = shapes[window] || shapes.hourly;
   const points = selected.labels.map((label, index) => {
-    const load = selected.multipliers[index] * (0.9 + roomWeight * 0.05);
+    const shape = selected.multipliers[index];
+    const dynamicBias = (
+      (heatBias * 0.22) +
+      (lightBias * 0.16) +
+      (occupancyBias * 0.18) +
+      (roomWeight * 0.03)
+    );
+    const load = (shape + selected.offset + dynamicBias) * selected.scale;
     const value = Number((baseRate * load).toFixed(1));
     return {
       label,
       value,
       rate_tokens: value,
-      power_tokens: Number((basePower * load).toFixed(1)),
-      activity: Number((roomWeight * selected.multipliers[index] * 2.2).toFixed(1)),
+      power_tokens: Number((basePower * load * (0.92 + heatBias * 0.12)).toFixed(1)),
+      activity: Number(((0.8 + occupancyBias) * shape * (window === "hourly" ? 2.3 : window === "daily" ? 3.6 : 5.2)).toFixed(1)),
     };
   });
   const peakPoint = points.reduce((peak, point) => (point.value > peak.value ? point : peak), points[0]);
@@ -1220,6 +1656,38 @@ function scaleDashboardValue(value, range = "today") {
   return range === "week" ? value * 7 : value;
 }
 
+function averageTrendLoad(series) {
+  const points = series?.points || [];
+  if (!points.length) {
+    return 1;
+  }
+  const total = points.reduce((sum, point) => sum + Number(point.value || 0), 0);
+  const peak = Math.max(1, ...points.map((point) => Number(point.value || 0)));
+  return total / (points.length * peak);
+}
+
+function deriveWindowRoomComparison(roomComparison, trendSeries, trendWindow) {
+  const windowFactor = {
+    hourly: 0.42,
+    daily: 1,
+    weekly: 3.6,
+  }[trendWindow] || 1;
+  const trendBias = averageTrendLoad(trendSeries);
+  return roomComparison.map((item, index) => {
+    const rankBias = Math.max(0.84, 1 - (index * 0.035));
+    const occupancyBias = 0.92 + (Number(item.occupancy_score || 0) * 0.05);
+    const fanBias = 0.88 + (Number(item.avg_fan_percent || 0) / 220);
+    const lightBias = 0.9 + (Number(item.avg_light_percent || 0) / 260);
+    const blendedBias = Number(((occupancyBias + fanBias + lightBias) / 3).toFixed(3));
+    return {
+      ...item,
+      energy_kwh: Number((Number(item.energy_kwh || 0) * windowFactor * trendBias * blendedBias * rankBias).toFixed(2)),
+      cost_inr: Number((Number(item.cost_inr || 0) * windowFactor * trendBias * ((fanBias * 0.55) + (lightBias * 0.45)) * rankBias).toFixed(2)),
+      occupancy_score: Number((Number(item.occupancy_score || 0) * (0.86 + trendBias * 0.38)).toFixed(1)),
+    };
+  });
+}
+
 function renderDashboard(dashboard, state, panelIds) {
   if (!dashboard) {
     return;
@@ -1244,6 +1712,7 @@ function renderDashboard(dashboard, state, panelIds) {
     daily: "Daily trend",
     weekly: "Weekly trend",
   }[state.trendWindow] || "Trend";
+  const windowAdjustedComparison = deriveWindowRoomComparison(roomComparison, trendSeries, state.trendWindow);
   document.getElementById(panelIds.summaryId).innerHTML = [
     summaryCard("Energy tokens", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0), state.range).toFixed(2)} tok`),
     summaryCard("Bill tokens", `${scaleDashboardValue(Number(summary.total_cost_today_inr || 0), state.range).toFixed(2)} tok`),
@@ -1252,7 +1721,7 @@ function renderDashboard(dashboard, state, panelIds) {
     summaryCard("Efficiency", `${Number(summary.efficiency_score || 0).toFixed(1)} · Save ${Number(summary.savings_opportunity_percent || 0).toFixed(1)}%`),
   ].join("");
 
-  const roomChartData = roomComparison.map((item) => {
+  const roomChartData = windowAdjustedComparison.map((item) => {
     const metric = metricAccessor(item);
     return {
       label: item.name,
@@ -1331,28 +1800,123 @@ function summaryCard(label, value) {
   return `<div class="summary-chip"><span>${label}</span><strong>${value}</strong></div>`;
 }
 
+function escapeSvgText(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function shortenChartLabel(label, maxLength = 12) {
+  const compact = String(label ?? "")
+    .replace(/\bAssembly\b/gi, "Asm")
+    .replace(/\bLine\b/gi, "Ln")
+    .replace(/\bFabrication\b/gi, "Fab")
+    .replace(/\bControl\b/gi, "Ctrl")
+    .replace(/\bPackaging\b/gi, "Pack")
+    .replace(/\bMaintenance\b/gi, "Maint")
+    .replace(/\bStorage\b/gi, "Store")
+    .replace(/\bDispatch\b/gi, "Disp")
+    .replace(/\bUtility\b/gi, "Util")
+    .replace(/\bRoom\b/gi, "Rm")
+    .replace(/\bLaboratory\b/gi, "Lab")
+    .replace(/\s+/g, " ")
+    .trim();
+  return compact.length > maxLength ? `${compact.slice(0, maxLength - 1)}…` : compact;
+}
+
+function splitLabelLines(label, maxLineLength = 10, maxLines = 2) {
+  const words = shortenChartLabel(label, maxLineLength * maxLines).split(" ");
+  if (!words.length) {
+    return [""];
+  }
+  const lines = [];
+  let current = "";
+  words.forEach((word) => {
+    if (!current.length) {
+      current = word;
+      return;
+    }
+    if (`${current} ${word}`.length <= maxLineLength) {
+      current = `${current} ${word}`;
+      return;
+    }
+    lines.push(current);
+    current = word;
+  });
+  if (current.length) {
+    lines.push(current);
+  }
+  if (lines.length > maxLines) {
+    const visible = lines.slice(0, maxLines);
+    visible[maxLines - 1] = shortenChartLabel(`${visible[maxLines - 1]} ${lines.slice(maxLines).join(" ")}`, maxLineLength);
+    return visible;
+  }
+  return lines;
+}
+
+function renderSvgTextLines(x, y, lines, className, options = {}) {
+  const lineHeight = options.lineHeight || 14;
+  const anchor = options.anchor || "middle";
+  const title = options.title ? `<title>${escapeSvgText(options.title)}</title>` : "";
+  const tspans = lines
+    .map((line, index) => `<tspan x="${x}" dy="${index === 0 ? 0 : lineHeight}">${escapeSvgText(line)}</tspan>`)
+    .join("");
+  return `<text x="${x}" y="${y}" text-anchor="${anchor}" class="${className}">${title}${tspans}</text>`;
+}
+
+function compactMetricLabel(label) {
+  return String(label ?? "")
+    .replace(/\bbill tok\/hr\b/gi, "tok/h")
+    .replace(/\bbill tok\b/gi, "tok")
+    .replace(/\benergy tok\b/gi, "eng")
+    .replace(/\bpower tok\b/gi, "pwr")
+    .replace(/\bpersons\b/gi, "ppl")
+    .replace(/\bavg fan\b/gi, "fan")
+    .replace(/\bavg light\b/gi, "light")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function renderBarChartSvg(data, options = {}) {
   if (!data.length) {
     return `<div class="chart-empty">No chart data yet.</div>`;
   }
-  const width = 640;
+  const width = Math.max(760, data.length * 92);
   const height = options.height || 320;
-  const padding = { top: 22, right: 18, bottom: 74, left: 18 };
+  const padding = { top: 28, right: 24, bottom: 92, left: 24 };
   const innerWidth = width - padding.left - padding.right;
   const innerHeight = height - padding.top - padding.bottom;
   const maxValue = Math.max(1, ...data.map((item) => item.value || 0));
-  const gap = 18;
-  const barWidth = Math.max(42, (innerWidth - gap * (data.length - 1)) / data.length);
+  const gap = 22;
+  const barWidth = Math.max(38, (innerWidth - gap * (data.length - 1)) / data.length);
   const bars = data
     .map((item, index) => {
       const scaledHeight = (item.value / maxValue) * innerHeight;
       const x = padding.left + index * (barWidth + gap);
       const y = padding.top + (innerHeight - scaledHeight);
+      const axisLabel = renderSvgTextLines(
+        x + barWidth / 2,
+        height - 44,
+        splitLabelLines(item.label, 10, 2),
+        "svg-axis-label",
+        { title: item.label }
+      );
+      const valueLabel = renderSvgTextLines(
+        x + barWidth / 2,
+        Math.max(20, y - 12),
+        [compactMetricLabel(item.meta)],
+        "svg-value-label",
+        { title: item.meta }
+      );
       return `
         <g class="chart-bar-group">
+          <title>${escapeSvgText(`${item.label}: ${item.meta}`)}</title>
           <rect x="${x}" y="${y}" width="${barWidth}" height="${scaledHeight}" rx="16" fill="url(#${options.gradientId || "barGradient"})"></rect>
-          <text x="${x + barWidth / 2}" y="${height - 36}" text-anchor="middle" class="svg-axis-label">${item.label}</text>
-          <text x="${x + barWidth / 2}" y="${y - 10}" text-anchor="middle" class="svg-value-label">${item.meta}</text>
+          ${axisLabel}
+          ${valueLabel}
         </g>
       `;
     })
@@ -1365,7 +1929,7 @@ function renderBarChartSvg(data, options = {}) {
     .join("");
   return `
     <div class="chart-svg-wrap">
-      <svg viewBox="0 0 ${width} ${height}" class="chart-svg" role="img" aria-label="Room comparison chart">
+      <svg viewBox="0 0 ${width} ${height}" class="chart-svg" style="min-width:${width}px" role="img" aria-label="Room comparison chart">
         <defs>
           <linearGradient id="${options.gradientId || "barGradient"}" x1="0%" y1="0%" x2="100%" y2="100%">
             <stop offset="0%" stop-color="#bd632f"></stop>
@@ -1383,7 +1947,7 @@ function renderLineChartSvg(data, options = {}) {
   if (!data.length) {
     return `<div class="chart-empty">No chart data yet.</div>`;
   }
-  const width = 640;
+  const width = Math.max(640, data.length * 100);
   const height = options.height || 320;
   const padding = { top: 24, right: 20, bottom: 62, left: 20 };
   const innerWidth = width - padding.left - padding.right;
@@ -1398,13 +1962,18 @@ function renderLineChartSvg(data, options = {}) {
   const linePath = buildSmoothPath(points);
   const areaPath = `${linePath} L ${padding.left + innerWidth} ${padding.top + innerHeight} L ${padding.left} ${padding.top + innerHeight} Z`;
   const pointNodes = points
-    .map((point) => `
-      <g class="chart-point-group">
-        <circle cx="${point.x}" cy="${point.y}" r="5" fill="${options.point || "#bd632f"}"></circle>
-        <text x="${point.x}" y="${height - 24}" text-anchor="middle" class="svg-axis-label">${point.label}</text>
-        <text x="${point.x}" y="${point.y - 12}" text-anchor="middle" class="svg-value-label">${point.meta}</text>
-      </g>
-    `)
+    .map((point, index) => {
+      const placeBelow = index % 2 === 1;
+      const pointLabelY = placeBelow ? Math.min(height - 84, point.y + 22) : Math.max(18, point.y - 12);
+      return `
+        <g class="chart-point-group">
+          <title>${escapeSvgText(`${point.label}: ${point.meta}`)}</title>
+          <circle cx="${point.x}" cy="${point.y}" r="5" fill="${options.point || "#bd632f"}"></circle>
+          ${renderSvgTextLines(point.x, height - 24, [point.label], "svg-axis-label", { title: point.label })}
+          ${renderSvgTextLines(point.x, pointLabelY, [compactMetricLabel(point.meta)], "svg-value-label", { title: point.meta })}
+        </g>
+      `;
+    })
     .join("");
   const gridLines = [0.2, 0.4, 0.6, 0.8, 1]
     .map((step) => {
@@ -1414,7 +1983,7 @@ function renderLineChartSvg(data, options = {}) {
     .join("");
   return `
     <div class="chart-svg-wrap">
-      <svg viewBox="0 0 ${width} ${height}" class="chart-svg" role="img" aria-label="Hourly trend chart">
+      <svg viewBox="0 0 ${width} ${height}" class="chart-svg" style="min-width:${width}px" role="img" aria-label="Hourly trend chart">
         ${gridLines}
         <path d="${areaPath}" fill="${options.fill || "rgba(74, 143, 134, 0.12)"}"></path>
         <path d="${linePath}" fill="none" stroke="${options.stroke || "#4a8f86"}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"></path>
@@ -1490,6 +2059,65 @@ async function updateRoomSensors(roomId, root) {
       input.dataset.userAdjusting = "false";
     });
   }
+}
+
+function roomWithLiveInputs(room, root) {
+  if (!room || !root) {
+    return room;
+  }
+  const fanSlider = root.querySelector(`[data-room-id="${room.id}"][data-device-kind="fan"]`);
+  const lightSlider = root.querySelector(`[data-room-id="${room.id}"][data-device-kind="light"]`);
+  const fanToggle = root.querySelector(`#fan-toggle-${room.id}`);
+  const lightToggle = root.querySelector(`#light-toggle-${room.id}`);
+  const occupancyStepper = root.querySelector(`#occupancy-stepper-${room.id}`);
+  const liveRoom = {
+    ...room,
+    sensors: {
+      ...room.sensors,
+      temperature: Number(root.querySelector(`[data-sensor-key="temperature"]`)?.value ?? room.sensors.temperature),
+      ambient_light: Number(root.querySelector(`[data-sensor-key="ambient_light"]`)?.value ?? room.sensors.ambient_light),
+      occupancy_count: Number(occupancyStepper ? occupancyStepper.textContent : room.sensors.occupancy_count),
+    },
+    devices: {
+      ...room.devices,
+      fan: {
+        ...room.devices.fan,
+        speed_percent: Number(fanSlider?.value ?? room.devices.fan.speed_percent),
+        state: (fanToggle?.classList.contains("on") ?? (Number(fanSlider?.value ?? room.devices.fan.speed_percent) > 0)) ? "ON" : "OFF",
+      },
+      light: {
+        ...room.devices.light,
+        brightness: Number(lightSlider?.value ?? room.devices.light.brightness),
+        state: (lightToggle?.classList.contains("on") ?? (Number(lightSlider?.value ?? room.devices.light.brightness) > 0)) ? "ON" : "OFF",
+      },
+    },
+  };
+  liveRoom.sensors.occupancy_level = formatOccupancyLevel(Number(liveRoom.sensors.occupancy_count || 0));
+  liveRoom.devices.fan.speed = fanBandFromPercent(Number(liveRoom.devices.fan.speed_percent || 0));
+  return liveRoom;
+}
+
+async function flushPendingRoomSensorSync(roomId, root) {
+  const timer = sensorSyncTimers.get(roomId);
+  if (!timer || !root) {
+    return;
+  }
+  clearTimeout(timer);
+  sensorSyncTimers.delete(roomId);
+  await updateRoomSensors(roomId, root);
+}
+
+function cancelPendingRoomDeviceSync(room) {
+  if (!room) {
+    return;
+  }
+  [room.devices?.fan?.id, room.devices?.light?.id].forEach((deviceId) => {
+    const timer = deviceSyncTimers.get(deviceId);
+    if (timer) {
+      clearTimeout(timer);
+      deviceSyncTimers.delete(deviceId);
+    }
+  });
 }
 
 function scheduleRoomSensorUpdate(roomId, root, delayMs = 180) {
@@ -1577,7 +2205,7 @@ function paintVoiceStatus(roomId) {
   }
   const speakerState = assistState(roomId);
   card.voiceStatus.textContent =
-    roomVoiceFeedback.get(roomId) || "Tap mic and speak for this room.";
+    roomVoiceFeedback.get(roomId) || "";
   if (card.voiceDebug) {
     card.voiceDebug.textContent =
       roomVoiceDebug.get(roomId) || "No voice activity yet.";
@@ -1910,6 +2538,11 @@ function startRoomVoiceCapture(roomId) {
 }
 
 document.getElementById("houseGrid").addEventListener("click", async (event) => {
+  const optimizeButton = event.target.closest("[data-optimize-room='true']");
+  if (optimizeButton && !optimizeButton.disabled) {
+    await startRoomOptimization(optimizeButton.dataset.roomId, "home");
+    return;
+  }
   const speakerButton = event.target.closest("[data-voice-kind='speaker']");
   if (speakerButton && !speakerButton.disabled) {
     const roomId = speakerButton.dataset.roomId;
@@ -1930,9 +2563,17 @@ document.getElementById("houseGrid").addEventListener("click", async (event) => 
   }
   const toggle = event.target.closest("[data-device-kind$='toggle']");
   if (toggle && !toggle.disabled) {
+    const roomId = toggle.dataset.roomId;
+    const deviceKind = toggle.dataset.deviceKind === "fan-toggle" ? "fan" : "light";
+    const turningOff = toggle.classList.contains("on");
+    setManualOffLock("home", roomId, deviceKind, turningOff);
+    if (!turningOff) {
+      setManualOffLock("home", roomId, deviceKind, false);
+    }
     await applyDeviceControl(toggle.dataset.deviceId, Number(toggle.dataset.level || 0), {
       resume: toggle.dataset.resume === "true",
     });
+    return;
   }
   const stepperButton = event.target.closest("[data-occupancy-step]");
   if (stepperButton) {
@@ -1944,7 +2585,7 @@ document.getElementById("houseGrid").addEventListener("click", async (event) => 
     const stepperValue = card.root.querySelector(`#occupancy-stepper-${roomId}`);
     const nextValue = Math.max(0, Math.min(MAX_OCCUPANCY, Number(stepperValue.textContent) + Number(stepperButton.dataset.occupancyStep)));
     const occupancyValue = card.root.querySelector(`#sensor-value-${roomId}-occupancy_count`);
-    if (occupancyValue) occupancyValue.textContent = `${nextValue} persons`;
+    if (occupancyValue) occupancyValue.textContent = `${nextValue}`;
     if (stepperValue) stepperValue.textContent = String(nextValue);
     if (card.occupancyDown) {
       card.occupancyDown.disabled = nextValue <= 0;
@@ -1971,6 +2612,7 @@ document.getElementById("houseGrid").addEventListener("input", (event) => {
     return;
   }
   if (input.dataset.deviceKind) {
+    setManualOffLock("home", input.dataset.roomId, input.dataset.deviceKind, false);
     input.dataset.userAdjusting = "true";
     input.dataset.syncPending = "true";
     input.parentElement.querySelector("strong").textContent = `${input.value}${input.dataset.deviceSuffix}`;
@@ -2006,6 +2648,7 @@ document.getElementById("houseGrid").addEventListener("change", async (event) =>
     return;
   }
   if (input.dataset.deviceKind && !input.disabled) {
+    setManualOffLock("home", input.dataset.roomId, input.dataset.deviceKind, false);
     const existing = deviceSyncTimers.get(input.dataset.deviceId);
     if (existing) {
       clearTimeout(existing);
@@ -2018,19 +2661,30 @@ document.getElementById("houseGrid").addEventListener("change", async (event) =>
 });
 
 document.getElementById("industryGrid").addEventListener("click", (event) => {
+  const optimizeButton = event.target.closest("[data-optimize-room='true']");
+  if (optimizeButton && !optimizeButton.disabled) {
+    startRoomOptimization(optimizeButton.dataset.roomId, "industry");
+    return;
+  }
   const toggle = event.target.closest("[data-device-kind$='toggle']");
   if (toggle && !toggle.disabled) {
     const roomId = toggle.dataset.roomId;
     updateIndustryRoom(roomId, (room) => {
       if (toggle.dataset.deviceKind === "fan-toggle") {
         const turningOn = !room.devices.fan.state || room.devices.fan.state === "OFF";
+        setManualOffLock("industry", roomId, "fan", !turningOn);
         room.devices.fan.state = turningOn ? "ON" : "OFF";
-        room.devices.fan.speed_percent = turningOn ? recommendedFanStartupLevel(room) : 0;
+        room.devices.fan.speed_percent = turningOn
+          ? getStoredSetpoint("industry", roomId, "fan", recommendedFanStartupLevel(room))
+          : 0;
         room.devices.fan.speed = fanBandFromPercent(room.devices.fan.speed_percent);
       } else if (toggle.dataset.deviceKind === "light-toggle") {
         const turningOn = !room.devices.light.state || room.devices.light.state === "OFF";
+        setManualOffLock("industry", roomId, "light", !turningOn);
         room.devices.light.state = turningOn ? "ON" : "OFF";
-        room.devices.light.brightness = turningOn ? explicitIndustryLightLevel(room) : 0;
+        room.devices.light.brightness = turningOn
+          ? getStoredSetpoint("industry", roomId, "light", explicitIndustryLightLevel(room))
+          : 0;
       }
     });
     return;
@@ -2043,7 +2697,7 @@ document.getElementById("industryGrid").addEventListener("click", (event) => {
         0,
         Math.min(MAX_OCCUPANCY, Number(room.sensors.occupancy_count) + Number(stepperButton.dataset.occupancyStep))
       );
-      applyIndustrySensorResponse(room);
+      applyIndustrySensorResponse(room, "occupancy_count");
     });
   }
 });
@@ -2053,17 +2707,19 @@ document.getElementById("industryGrid").addEventListener("input", (event) => {
   if (input.dataset.sensorKey) {
     updateIndustryRoom(input.dataset.roomId, (room) => {
       room.sensors[input.dataset.sensorKey] = Number(input.value);
-      applyIndustrySensorResponse(room);
+      applyIndustrySensorResponse(room, input.dataset.sensorKey);
     });
     return;
   }
   if (input.dataset.deviceKind) {
     updateIndustryRoom(input.dataset.roomId, (room) => {
       if (input.dataset.deviceKind === "fan") {
+        setManualOffLock("industry", input.dataset.roomId, "fan", false);
         room.devices.fan.state = "ON";
         room.devices.fan.speed_percent = Number(input.value);
         room.devices.fan.speed = fanBandFromPercent(room.devices.fan.speed_percent);
       } else {
+        setManualOffLock("industry", input.dataset.roomId, "light", false);
         room.devices.light.state = "ON";
         room.devices.light.brightness = Number(input.value);
       }

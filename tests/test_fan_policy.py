@@ -244,6 +244,16 @@ class FanPolicyTestCase(unittest.TestCase):
 
         self.assertEqual(target, 90)
 
+    def test_high_occupancy_room_gets_aggressive_initial_speed(self):
+        target = occupied_target(
+            occupancy_count=5,
+            smoothed_temp=32.0,
+            smoothed_humidity=55.0,
+            config=self.config,
+        )
+
+        self.assertGreaterEqual(target, 80)
+
     def test_temperature_setpoint_bands_are_monotonic(self):
         config = self.config
         targets = [

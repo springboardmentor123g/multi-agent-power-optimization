@@ -18,9 +18,9 @@ class FanPolicyConfig:
     comfort_temp: float = 25.0
     hot_temp: float = 30.0
     comfort_humidity: float = 55.0
-    min_occupied_speed: int = 22
+    min_occupied_speed: int = 28
     humidity_gain: float = 0.18
-    occupancy_gain: float = 2.0
+    occupancy_gain: float = 6.0
     vacancy_grace_sec: int = 180
     empty_temp_start: float = 27.0
     empty_humidity_start: float = 80.0
@@ -495,12 +495,20 @@ def occupied_temp_setpoint_target(smoothed_temp: float, config: FanPolicyConfig)
         return 82
     if smoothed_temp >= 33.0:
         return 72
+    if smoothed_temp >= 32.0:
+        return 66
     if smoothed_temp >= 31.0:
         return 60
+    if smoothed_temp >= 30.0:
+        return 54
     if smoothed_temp >= 29.0:
         return 48
+    if smoothed_temp >= 28.0:
+        return 43
     if smoothed_temp >= 27.0:
         return 38
+    if smoothed_temp >= 26.0:
+        return 34
     if smoothed_temp >= 24.0:
         return 30
     return config.min_occupied_speed
