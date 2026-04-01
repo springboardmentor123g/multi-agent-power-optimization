@@ -14,7 +14,7 @@
     <section class="hero">
       <div>
         <p class="eyebrow">Room-Local Smart Home Simulator</p>
-        <h1>Smart home simulator.</h1>
+        <h1>Multi-Agent based Energy Optimization</h1>
       </div>
       <div class="hero-card">
         <p class="mono">Live tariff</p>
@@ -26,6 +26,8 @@
     <div class="view-tabs" id="viewTabs">
       <button class="view-tab active" type="button" data-view="home">Home</button>
       <button class="view-tab" type="button" data-view="dashboard">Dashboard</button>
+      <button class="view-tab" type="button" data-view="industry">Industry</button>
+      <button class="view-tab" type="button" data-view="dashboard-2">Dashboard-2</button>
     </div>
 
     <section id="homeView" class="view-panel active">
@@ -134,6 +136,113 @@
               <span class="subtle">Waste and idle load</span>
             </div>
             <div id="inefficiencyPanel" class="recommendation-list"></div>
+          </article>
+        </div>
+      </section>
+    </section>
+
+    <section id="industryView" class="view-panel">
+      <section class="panel home-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Industry View</p>
+            <h2>10-Room Industry Simulator</h2>
+          </div>
+          <div class="legend">
+            <span><i class="legend-dot light"></i>LED brightness</span>
+            <span><i class="legend-dot fan"></i>Fan speed and room-local sensors</span>
+          </div>
+        </div>
+        <div class="smart-home-topline">
+          <div class="mini-metric">
+            <span>Power Tokens</span>
+            <strong id="industryActivePower">0 tok</strong>
+          </div>
+          <div class="mini-metric">
+            <span>Rate Tokens</span>
+            <strong id="industryHourlyCost">0 tok/hr</strong>
+          </div>
+          <div class="mini-metric">
+            <span>Bill Tokens</span>
+            <strong id="industrySessionCost">0 tok</strong>
+          </div>
+          <div class="mini-metric">
+            <span>Daily Tokens</span>
+            <strong id="industryDailyCost">0 tok</strong>
+          </div>
+        </div>
+        <div id="industryGrid" class="house-grid"></div>
+      </section>
+    </section>
+
+    <section id="dashboard2View" class="view-panel">
+      <section class="panel dashboard-panel">
+        <div class="section-head">
+          <div>
+            <p class="eyebrow">Optimization & Prediction</p>
+            <h2>Dashboard-2</h2>
+          </div>
+          <div class="range-toggle" id="industryDashboardRangeTabs">
+            <button class="range-chip active" type="button" data-range="today">Today</button>
+            <button class="range-chip" type="button" data-range="week">7 Days</button>
+          </div>
+        </div>
+        <div class="dashboard-summary" id="industryDashboardSummary"></div>
+        <div class="dashboard-toolbar">
+          <div class="dashboard-select-row">
+            <label class="dashboard-select-shell">
+              <span>Room</span>
+              <select id="industryDashboardRoomSelect" class="dashboard-select">
+                <option value="all">All rooms</option>
+              </select>
+            </label>
+            <label class="dashboard-select-shell">
+              <span>Trend</span>
+              <select id="industryDashboardTrendSelect" class="dashboard-select">
+                <option value="hourly">Hourly trend</option>
+                <option value="daily">Daily trend</option>
+                <option value="weekly">Weekly trend</option>
+              </select>
+            </label>
+          </div>
+          <div class="range-toggle" id="industryDashboardMetricFilters">
+            <button class="range-chip active" type="button" data-metric-filter="cost">Cost</button>
+            <button class="range-chip" type="button" data-metric-filter="energy">Energy</button>
+            <button class="range-chip" type="button" data-metric-filter="fan">Fan</button>
+            <button class="range-chip" type="button" data-metric-filter="light">Light</button>
+            <button class="range-chip" type="button" data-metric-filter="occupancy">Occupancy</button>
+          </div>
+        </div>
+        <div class="dashboard-grid">
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Room-wise energy</h3>
+              <span class="subtle">Industry comparison</span>
+            </div>
+            <div id="industryRoomComparisonChart" class="chart-stack"></div>
+          </article>
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3 id="industryTrendChartTitle">Hourly trend</h3>
+              <span class="subtle" id="industryTrendChartSubtitle">Power and cost pattern</span>
+            </div>
+            <div id="industryHourlyTrendChart" class="chart-stack"></div>
+          </article>
+        </div>
+        <div class="dashboard-grid dashboard-grid-secondary">
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Recommendations</h3>
+              <span class="subtle">Prediction and policy preview</span>
+            </div>
+            <div id="industryRecommendationsPanel" class="recommendation-list"></div>
+          </article>
+          <article class="dashboard-card">
+            <div class="dashboard-card-head">
+              <h3>Inefficiencies</h3>
+              <span class="subtle">Waste and idle load</span>
+            </div>
+            <div id="industryInefficiencyPanel" class="recommendation-list"></div>
           </article>
         </div>
       </section>

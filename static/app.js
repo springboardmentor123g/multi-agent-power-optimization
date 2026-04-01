@@ -8,6 +8,7 @@ const roomVoiceFeedback = new Map();
 const roomVoiceDebug = new Map();
 const roomVoiceAssist = new Map();
 const latestRooms = new Map();
+const industryRoomElements = new Map();
 let latestSnapshotRequestId = 0;
 let latestAppliedSnapshotId = 0;
 let activeRecognition = null;
@@ -15,16 +16,29 @@ let activeListeningRoomId = null;
 let activeAssistListeningRoomId = null;
 let activeCommandProcessingRoomId = null;
 let latestSnapshot = null;
+let latestIndustryState = null;
 let latestSnapshotRenderedAt = 0;
-let dashboardRange = "today";
-let dashboardRoomFilter = "all";
-let dashboardMetricFilter = "cost";
-let dashboardTrendWindow = "hourly";
+let latestIndustryRenderedAt = 0;
+const homeDashboardState = { range: "today", roomFilter: "all", metricFilter: "cost", trendWindow: "hourly" };
+const industryDashboardState = { range: "today", roomFilter: "all", metricFilter: "cost", trendWindow: "hourly" };
 const UI_POWER_TOKEN_SCALE = 1.42;
 const UI_BILLING_RATE_TOKEN_SCALE = 960;
 const MAX_OCCUPANCY = 8;
 const VOICE_ASSIST_REPLY_TIMEOUT_MS = 12000;
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+const INDUSTRY_ROOM_BLUEPRINTS = [
+  { id: "industry_zone_1", name: "Assembly Line 1", template: "living_room", temperature: 32, ambient_light: 42, occupancy: 5 },
+  { id: "industry_zone_2", name: "Assembly Line 2", template: "kitchen", temperature: 31, ambient_light: 48, occupancy: 4 },
+  { id: "industry_zone_3", name: "Fabrication Bay", template: "study", temperature: 34, ambient_light: 38, occupancy: 6 },
+  { id: "industry_zone_4", name: "Control Room", template: "bedroom", temperature: 28, ambient_light: 56, occupancy: 2 },
+  { id: "industry_zone_5", name: "Packaging", template: "living_room", temperature: 30, ambient_light: 44, occupancy: 5 },
+  { id: "industry_zone_6", name: "Storage", template: "study", temperature: 27, ambient_light: 62, occupancy: 1 },
+  { id: "industry_zone_7", name: "Dispatch", template: "kitchen", temperature: 33, ambient_light: 36, occupancy: 4 },
+  { id: "industry_zone_8", name: "Maintenance", template: "bedroom", temperature: 29, ambient_light: 52, occupancy: 3 },
+  { id: "industry_zone_9", name: "QA Lab", template: "study", temperature: 26, ambient_light: 58, occupancy: 2 },
+  { id: "industry_zone_10", name: "Utility Hub", template: "living_room", temperature: 35, ambient_light: 34, occupancy: 6 },
+];
 
 function voiceLog(event, payload = {}) {
   console.log(`[smart-home][voice] ${event}`, payload);
@@ -138,7 +152,32 @@ function renderSnapshot(snapshot) {
   );
 
   renderRooms(snapshot.rooms);
-  renderDashboard(snapshot.dashboard);
+  if (!latestIndustryState) {
+    latestIndustryState = buildIndustryState(snapshot);
+  } else {
+    latestIndustryState.tariff = snapshot.tariff_inr_per_kwh;
+  }
+  recalculateIndustryState();
+  renderIndustrySnapshot();
+  syncIndustryRoomSelect();
+  renderDashboard(snapshot.dashboard, homeDashboardState, {
+    summaryId: "dashboardSummary",
+    comparisonId: "roomComparisonChart",
+    trendChartId: "hourlyTrendChart",
+    trendTitleId: "trendChartTitle",
+    trendSubtitleId: "trendChartSubtitle",
+    recommendationsId: "recommendationsPanel",
+    inefficienciesId: "inefficiencyPanel",
+  });
+  renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
+    summaryId: "industryDashboardSummary",
+    comparisonId: "industryRoomComparisonChart",
+    trendChartId: "industryHourlyTrendChart",
+    trendTitleId: "industryTrendChartTitle",
+    trendSubtitleId: "industryTrendChartSubtitle",
+    recommendationsId: "industryRecommendationsPanel",
+    inefficienciesId: "industryInefficiencyPanel",
+  });
 }
 
 function renderGlobalMetrics(metrics) {
@@ -162,9 +201,12 @@ function countOccupiedRooms(rooms) {
 }
 
 function renderRooms(rooms) {
-  const container = document.getElementById("houseGrid");
+  renderRoomCollection(document.getElementById("houseGrid"), roomElements, rooms, { voiceEnabled: true });
+}
+
+function renderRoomCollection(container, elementMap, rooms, options = {}) {
   Object.values(rooms).forEach((room) => {
-    const pendingCount = pendingOccupancy.get(room.id);
+    const pendingCount = options.pendingOccupancyMap ? options.pendingOccupancyMap.get(room.id) : pendingOccupancy.get(room.id);
     const roomForRender = pendingCount === undefined
       ? room
       : {
@@ -175,20 +217,141 @@ function renderRooms(rooms) {
             occupancy_level: formatOccupancyLevel(pendingCount),
           },
         };
-    latestRooms.set(room.id, room);
-    if (!roomElements.has(room.id)) {
-      const card = buildRoomCard(roomForRender);
-      roomElements.set(room.id, card);
+    if (options.storeLatest !== false) {
+      latestRooms.set(room.id, room);
+    }
+    if (!elementMap.has(room.id)) {
+      const card = buildRoomCard(roomForRender, options);
+      elementMap.set(room.id, card);
       container.append(card.root);
     }
-    updateRoomCard(roomElements.get(room.id), roomForRender);
+    updateRoomCard(elementMap.get(room.id), roomForRender);
   });
 }
 
-function buildRoomCard(room) {
+function buildIndustryState(snapshot) {
+  const sourceRooms = snapshot.rooms || {};
+  const rooms = {};
+  INDUSTRY_ROOM_BLUEPRINTS.forEach((blueprint, index) => {
+    const templateRoom =
+      sourceRooms[blueprint.template]
+      || sourceRooms[Object.keys(sourceRooms)[index % Math.max(1, Object.keys(sourceRooms).length)]];
+    if (!templateRoom) {
+      return;
+    }
+    const cloned = JSON.parse(JSON.stringify(templateRoom));
+    cloned.id = blueprint.id;
+    cloned.name = blueprint.name;
+    cloned.scope = "industry";
+    cloned.sensors.temperature = blueprint.temperature;
+    cloned.sensors.ambient_light = blueprint.ambient_light;
+    cloned.sensors.occupancy_count = blueprint.occupancy;
+    cloned.sensors.occupancy_level = formatOccupancyLevel(blueprint.occupancy);
+    cloned.devices.light.id = `${blueprint.id}_light`;
+    cloned.devices.fan.id = `${blueprint.id}_fan`;
+    cloned.devices.light.brightness = recommendedLightStartupLevel(cloned);
+    cloned.devices.light.state = "ON";
+    cloned.devices.fan.speed_percent = recommendedFanStartupLevel(cloned);
+    cloned.devices.fan.speed = fanBandFromPercent(cloned.devices.fan.speed_percent);
+    cloned.devices.fan.state = "ON";
+    rooms[blueprint.id] = cloned;
+  });
+  return {
+    tariff: Number(snapshot.tariff_inr_per_kwh || 8),
+    rooms,
+    metrics: {},
+    dashboard: null,
+  };
+}
+
+function recalculateIndustryState() {
+  if (!latestIndustryState) {
+    return;
+  }
+  const { roomMetrics, globalMetrics } = calculateSnapshotMetricsForUI(
+    latestIndustryState.rooms,
+    latestIndustryState.tariff || 8
+  );
+  Object.values(latestIndustryState.rooms).forEach((room) => {
+    room.metrics = roomMetrics[room.id];
+    room.devices.fan.speed = fanBandFromPercent(room.devices.fan.speed_percent);
+    room.sensors.occupancy_level = formatOccupancyLevel(room.sensors.occupancy_count);
+  });
+  latestIndustryState.metrics = globalMetrics;
+  latestIndustryState.dashboard = buildDashboardPreview(
+    latestIndustryState.rooms,
+    roomMetrics,
+    globalMetrics
+  );
+}
+
+function renderIndustrySnapshot() {
+  if (!latestIndustryState) {
+    return;
+  }
+  latestIndustryRenderedAt = performance.now();
+  renderRoomCollection(
+    document.getElementById("industryGrid"),
+    industryRoomElements,
+    latestIndustryState.rooms,
+    { voiceEnabled: false, scope: "industry", storeLatest: false }
+  );
+  animateMetricValue(document.getElementById("industryActivePower"), Number(latestIndustryState.metrics.power_tokens || 0), { suffix: " tok", decimals: 0 });
+  animateMetricValue(document.getElementById("industryHourlyCost"), Number(latestIndustryState.metrics.rate_tokens || 0), { suffix: " tok/hr", decimals: 0 });
+  primeLiveMeter(document.getElementById("industrySessionCost"), Number(latestIndustryState.metrics.billing_tokens || 0), Number(latestIndustryState.metrics.rate_tokens || 0), " tok");
+  animateMetricValue(document.getElementById("industryDailyCost"), Number(latestIndustryState.metrics.daily_projection_tokens || 0), { suffix: " tok", decimals: 0 });
+}
+
+function syncIndustryRoomSelect() {
+  const select = document.getElementById("industryDashboardRoomSelect");
+  if (!select || !latestIndustryState) {
+    return;
+  }
+  const current = select.value || "all";
+  const options = [
+    `<option value="all">All rooms</option>`,
+    ...Object.values(latestIndustryState.rooms).map(
+      (room) => `<option value="${room.id}">${room.name}</option>`
+    ),
+  ];
+  select.innerHTML = options.join("");
+  select.value = Object.prototype.hasOwnProperty.call(latestIndustryState.rooms, current) || current === "all"
+    ? current
+    : "all";
+  industryDashboardState.roomFilter = select.value;
+}
+
+function fanBandFromPercent(value) {
+  const percent = Number(value || 0);
+  if (percent <= 0) return "OFF";
+  if (percent <= 30) return "LOW";
+  if (percent <= 70) return "MEDIUM";
+  return "HIGH";
+}
+
+function updateIndustryRoom(roomId, mutator) {
+  if (!latestIndustryState?.rooms?.[roomId]) {
+    return;
+  }
+  mutator(latestIndustryState.rooms[roomId]);
+  recalculateIndustryState();
+  renderIndustrySnapshot();
+  renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
+    summaryId: "industryDashboardSummary",
+    comparisonId: "industryRoomComparisonChart",
+    trendChartId: "industryHourlyTrendChart",
+    trendTitleId: "industryTrendChartTitle",
+    trendSubtitleId: "industryTrendChartSubtitle",
+    recommendationsId: "industryRecommendationsPanel",
+    inefficienciesId: "industryInefficiencyPanel",
+  });
+}
+
+function buildRoomCard(room, options = {}) {
   const root = document.createElement("article");
   root.className = "room-card";
   root.dataset.roomId = room.id;
+  root.dataset.scope = options.scope || "home";
   root.innerHTML = `
     <div class="room-header">
       <div class="room-title">
@@ -233,15 +396,11 @@ function buildRoomCard(room) {
     </div>
     <div class="room-footer">
       <div class="room-inline-metrics">
-        <span class="metric-pill"><strong id="room-power-${room.id}">0 W</strong></span>
-        <span class="metric-pill"><strong id="room-cost-${room.id}">₹0.00</strong></span>
-        <span class="metric-pill"><strong id="occupancy-label-${room.id}">Absent</strong></span>
+        <span class="metric-pill"><span>Power</span><strong id="room-power-${room.id}">0 W</strong></span>
+        <span class="metric-pill"><span>Bill</span><strong id="room-cost-${room.id}">₹0.00</strong></span>
+        <span class="metric-pill"><span>Occupancy</span><strong id="occupancy-label-${room.id}">Absent</strong></span>
       </div>
       <div class="voice-note" id="voice-status-${room.id}">Voice idle.</div>
-      <details class="room-drawer voice-drawer">
-        <summary>Voice debug</summary>
-        <pre class="voice-debug-log" id="voice-debug-${room.id}">No voice activity yet.</pre>
-      </details>
       <div class="control-deck">
         <div class="hud-module">
           <div class="hud-meta">
@@ -280,10 +439,11 @@ function buildRoomCard(room) {
 
   return {
     root,
+    scope: root.dataset.scope,
+    voiceEnabled: options.voiceEnabled !== false,
     name: root.querySelector(`#room-name-${room.id}`),
     badge: root.querySelector(`#room-badge-${room.id}`),
     voiceStatus: root.querySelector(`#voice-status-${room.id}`),
-    voiceDebug: root.querySelector(`#voice-debug-${room.id}`),
     sensorPopover: root.querySelector(`#sensor-popover-${room.id}`),
     speakerButton: root.querySelector(`#voice-speaker-${room.id}`),
     micButton: root.querySelector(`#voice-mic-${room.id}`),
@@ -344,7 +504,9 @@ function updateRoomCard(card, room) {
   card.name.textContent = room.name;
   card.badge.textContent = lightOn || fanSwitchOn ? "Live" : "Idle";
   card.voiceStatus.textContent = voiceFeedback;
-  card.voiceDebug.textContent = voiceDebug;
+  if (card.voiceDebug) {
+    card.voiceDebug.textContent = voiceDebug;
+  }
   card.speakerButton.classList.toggle(
     "listening",
     speakerState === "awaiting_reply" || speakerState === "capturing_reply"
@@ -355,8 +517,10 @@ function updateRoomCard(card, room) {
   );
   card.micButton.classList.toggle("listening", activeListeningRoomId === room.id);
   card.micButton.classList.toggle("processing", activeCommandProcessingRoomId === room.id);
-  card.speakerButton.disabled = false;
-  card.micButton.disabled = !SpeechRecognition;
+  card.speakerButton.disabled = !card.voiceEnabled;
+  card.micButton.disabled = !card.voiceEnabled || !SpeechRecognition;
+  card.speakerButton.hidden = !card.voiceEnabled;
+  card.micButton.hidden = !card.voiceEnabled;
   card.micButton.textContent =
     activeCommandProcessingRoomId === room.id
       ? "…"
@@ -899,6 +1063,42 @@ function tickLiveTokenMeters() {
     card.roomCost.dataset.numericValue = String(nextValue);
     card.roomCost.textContent = `${nextValue.toFixed(1)} tok`;
   });
+  industryRoomElements.forEach((card) => {
+    const industryElapsedSeconds = latestIndustryRenderedAt
+      ? Math.max(0, (performance.now() - latestIndustryRenderedAt) / 1000)
+      : elapsedSeconds;
+    const base = Number(card.roomCost.dataset.liveBase || 0);
+    const rate = Number(card.roomCost.dataset.liveRate || 0);
+    const nextValue = base + ((rate / 3600) * industryElapsedSeconds);
+    card.roomCost.dataset.numericValue = String(nextValue);
+    card.roomCost.textContent = `${nextValue.toFixed(1)} tok`;
+  });
+  const industryMeter = document.getElementById("industrySessionCost");
+  if (industryMeter) {
+    const industryElapsedSeconds = latestIndustryRenderedAt
+      ? Math.max(0, (performance.now() - latestIndustryRenderedAt) / 1000)
+      : elapsedSeconds;
+    const base = Number(industryMeter.dataset.liveBase || 0);
+    const rate = Number(industryMeter.dataset.liveRate || 0);
+    const nextValue = base + ((rate / 3600) * industryElapsedSeconds);
+    industryMeter.dataset.numericValue = String(nextValue);
+    industryMeter.textContent = `${nextValue.toFixed(1)} tok`;
+  }
+}
+
+function applyIndustrySensorResponse(room) {
+  const predictedFan = recommendedFanStartupLevel(room);
+  room.devices.fan.speed_percent = predictedFan;
+  room.devices.fan.state = "ON";
+  room.devices.fan.speed = fanBandFromPercent(predictedFan);
+
+  const predictedLight = recommendedLightStartupLevel(room);
+  room.devices.light.brightness = predictedLight;
+  room.devices.light.state = "ON";
+}
+
+function explicitIndustryLightLevel(room) {
+  return Math.max(18, recommendedLightStartupLevel(room));
 }
 
 function formatOccupancyLevel(count) {
@@ -1016,37 +1216,37 @@ function normalizeDashboardPayload(dashboard) {
   };
 }
 
-function scaleDashboardValue(value) {
-  return dashboardRange === "week" ? value * 7 : value;
+function scaleDashboardValue(value, range = "today") {
+  return range === "week" ? value * 7 : value;
 }
 
-function renderDashboard(dashboard) {
+function renderDashboard(dashboard, state, panelIds) {
   if (!dashboard) {
     return;
   }
   const normalizedDashboard = normalizeDashboardPayload(dashboard);
   const roomComparisonSource = normalizedDashboard.room_comparison || [];
   const filteredRoomComparison = roomComparisonSource.filter((item) => (
-    dashboardRoomFilter === "all" ? true : item.room_id === dashboardRoomFilter
+    state.roomFilter === "all" ? true : item.room_id === state.roomFilter
   ));
   const roomComparison = filteredRoomComparison.length ? filteredRoomComparison : roomComparisonSource;
   const metricAccessor = {
-    cost: (item) => ({ value: item.cost_inr, label: `${scaleDashboardValue(item.cost_inr).toFixed(2)} bill tok` }),
-    energy: (item) => ({ value: item.energy_kwh, label: `${scaleDashboardValue(item.energy_kwh).toFixed(2)} energy tok` }),
+    cost: (item) => ({ value: item.cost_inr, label: `${scaleDashboardValue(item.cost_inr, state.range).toFixed(2)} bill tok` }),
+    energy: (item) => ({ value: item.energy_kwh, label: `${scaleDashboardValue(item.energy_kwh, state.range).toFixed(2)} energy tok` }),
     fan: (item) => ({ value: item.avg_fan_percent, label: `${item.avg_fan_percent.toFixed(0)}% avg fan` }),
     light: (item) => ({ value: item.avg_light_percent, label: `${item.avg_light_percent.toFixed(0)}% avg light` }),
     occupancy: (item) => ({ value: item.occupancy_score, label: `${item.occupancy_score.toFixed(1)} persons` }),
-  }[dashboardMetricFilter];
+  }[state.metricFilter];
   const summary = normalizedDashboard.summary || {};
-  const trendSeries = normalizedDashboard.trends?.[dashboardTrendWindow] || normalizedDashboard.trends?.hourly || { points: [], subtitle: "" };
+  const trendSeries = normalizedDashboard.trends?.[state.trendWindow] || normalizedDashboard.trends?.hourly || { points: [], subtitle: "" };
   const trendLabel = {
     hourly: "Hourly trend",
     daily: "Daily trend",
     weekly: "Weekly trend",
-  }[dashboardTrendWindow] || "Trend";
-  document.getElementById("dashboardSummary").innerHTML = [
-    summaryCard("Energy tokens", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0)).toFixed(2)} tok`),
-    summaryCard("Bill tokens", `${scaleDashboardValue(Number(summary.total_cost_today_inr || 0)).toFixed(2)} tok`),
+  }[state.trendWindow] || "Trend";
+  document.getElementById(panelIds.summaryId).innerHTML = [
+    summaryCard("Energy tokens", `${scaleDashboardValue(Number(summary.total_energy_today_kwh || 0), state.range).toFixed(2)} tok`),
+    summaryCard("Bill tokens", `${scaleDashboardValue(Number(summary.total_cost_today_inr || 0), state.range).toFixed(2)} tok`),
     summaryCard("Highest room", summary.highest_consuming_room || "N/A"),
     summaryCard("Peak usage", summary.peak_usage_hour || "N/A"),
     summaryCard("Efficiency", `${Number(summary.efficiency_score || 0).toFixed(1)} · Save ${Number(summary.savings_opportunity_percent || 0).toFixed(1)}%`),
@@ -1060,18 +1260,18 @@ function renderDashboard(dashboard) {
       meta: metric.label,
     };
   });
-  document.getElementById("roomComparisonChart").innerHTML = renderBarChartSvg(roomChartData, {
+  document.getElementById(panelIds.comparisonId).innerHTML = renderBarChartSvg(roomChartData, {
     height: 320,
-    gradientId: "roomBarGradient",
+    gradientId: `${panelIds.comparisonId}Gradient`,
   });
 
   const trendMetricValue = {
-    cost: (item) => ({ value: scaleDashboardValue(item.rate_tokens), label: `${scaleDashboardValue(item.rate_tokens).toFixed(0)} bill tok/hr` }),
-    energy: (item) => ({ value: scaleDashboardValue(item.power_tokens), label: `${scaleDashboardValue(item.power_tokens).toFixed(0)} power tok` }),
+    cost: (item) => ({ value: scaleDashboardValue(item.rate_tokens, state.range), label: `${scaleDashboardValue(item.rate_tokens, state.range).toFixed(0)} bill tok/hr` }),
+    energy: (item) => ({ value: scaleDashboardValue(item.power_tokens, state.range), label: `${scaleDashboardValue(item.power_tokens, state.range).toFixed(0)} power tok` }),
     fan: (item) => ({ value: item.activity * 18, label: `${Math.round(item.activity * 12)} fan load` }),
     light: (item) => ({ value: item.activity * 15, label: `${Math.round(item.activity * 10)} light load` }),
     occupancy: (item) => ({ value: item.activity, label: `${item.activity.toFixed(1)} activity` }),
-  }[dashboardMetricFilter];
+  }[state.metricFilter];
   const trendChartData = trendSeries.points.map((item) => {
     const metric = trendMetricValue(item);
     return {
@@ -1080,9 +1280,9 @@ function renderDashboard(dashboard) {
       meta: metric.label,
     };
   });
-  document.getElementById("trendChartTitle").textContent = trendLabel;
-  document.getElementById("trendChartSubtitle").textContent = `${trendSeries.subtitle || "Adaptive room behavior"} · Peak ${trendSeries.peak_label || "N/A"}`;
-  document.getElementById("hourlyTrendChart").innerHTML = renderLineChartSvg(trendChartData, {
+  document.getElementById(panelIds.trendTitleId).textContent = trendLabel;
+  document.getElementById(panelIds.trendSubtitleId).textContent = `${trendSeries.subtitle || "Adaptive room behavior"} · Peak ${trendSeries.peak_label || "N/A"}`;
+  document.getElementById(panelIds.trendChartId).innerHTML = renderLineChartSvg(trendChartData, {
     height: 320,
     stroke: "#4a8f86",
     fill: "rgba(74, 143, 134, 0.14)",
@@ -1094,20 +1294,21 @@ function renderDashboard(dashboard) {
     dashboard: normalizedDashboard,
     trendSeries,
     selectedRoom,
+    trendWindow: state.trendWindow,
   });
-  document.getElementById("recommendationsPanel").innerHTML = [
+  document.getElementById(panelIds.recommendationsId).innerHTML = [
     ...adaptiveRecommendations,
     ...(normalizedDashboard.policy_preview || []),
   ]
     .map((item) => `<div class="recommendation-item">${item}</div>`)
     .join("");
 
-  document.getElementById("inefficiencyPanel").innerHTML = (normalizedDashboard.inefficiencies || [])
+  document.getElementById(panelIds.inefficienciesId).innerHTML = (normalizedDashboard.inefficiencies || [])
     .map((item) => `<div class="recommendation-item">${item}</div>`)
     .join("");
 }
 
-function buildAdaptiveRecommendations({ dashboard, trendSeries, selectedRoom }) {
+function buildAdaptiveRecommendations({ dashboard, trendSeries, selectedRoom, trendWindow }) {
   const points = trendSeries.points || [];
   if (!points.length) {
     return dashboard.recommendations || [];
@@ -1118,7 +1319,7 @@ function buildAdaptiveRecommendations({ dashboard, trendSeries, selectedRoom }) 
     hourly: "today",
     daily: "this week",
     weekly: "this cycle",
-  }[dashboardTrendWindow] || "the current trend";
+  }[trendWindow] || "the current trend";
   return [
     `${selectedRoom} is projected to peak around ${peakPoint.label} for ${windowLabel}.`,
     `${selectedRoom} has a softer demand window near ${lowPoint.label}; that is the best time to trim light or fan output.`,
@@ -1377,8 +1578,10 @@ function paintVoiceStatus(roomId) {
   const speakerState = assistState(roomId);
   card.voiceStatus.textContent =
     roomVoiceFeedback.get(roomId) || "Tap mic and speak for this room.";
-  card.voiceDebug.textContent =
-    roomVoiceDebug.get(roomId) || "No voice activity yet.";
+  if (card.voiceDebug) {
+    card.voiceDebug.textContent =
+      roomVoiceDebug.get(roomId) || "No voice activity yet.";
+  }
   card.speakerButton.classList.toggle(
     "listening",
     speakerState === "awaiting_reply" || speakerState === "capturing_reply"
@@ -1814,6 +2017,60 @@ document.getElementById("houseGrid").addEventListener("change", async (event) =>
   }
 });
 
+document.getElementById("industryGrid").addEventListener("click", (event) => {
+  const toggle = event.target.closest("[data-device-kind$='toggle']");
+  if (toggle && !toggle.disabled) {
+    const roomId = toggle.dataset.roomId;
+    updateIndustryRoom(roomId, (room) => {
+      if (toggle.dataset.deviceKind === "fan-toggle") {
+        const turningOn = !room.devices.fan.state || room.devices.fan.state === "OFF";
+        room.devices.fan.state = turningOn ? "ON" : "OFF";
+        room.devices.fan.speed_percent = turningOn ? recommendedFanStartupLevel(room) : 0;
+        room.devices.fan.speed = fanBandFromPercent(room.devices.fan.speed_percent);
+      } else if (toggle.dataset.deviceKind === "light-toggle") {
+        const turningOn = !room.devices.light.state || room.devices.light.state === "OFF";
+        room.devices.light.state = turningOn ? "ON" : "OFF";
+        room.devices.light.brightness = turningOn ? explicitIndustryLightLevel(room) : 0;
+      }
+    });
+    return;
+  }
+  const stepperButton = event.target.closest("[data-occupancy-step]");
+  if (stepperButton) {
+    const roomId = stepperButton.dataset.roomId;
+    updateIndustryRoom(roomId, (room) => {
+      room.sensors.occupancy_count = Math.max(
+        0,
+        Math.min(MAX_OCCUPANCY, Number(room.sensors.occupancy_count) + Number(stepperButton.dataset.occupancyStep))
+      );
+      applyIndustrySensorResponse(room);
+    });
+  }
+});
+
+document.getElementById("industryGrid").addEventListener("input", (event) => {
+  const input = event.target;
+  if (input.dataset.sensorKey) {
+    updateIndustryRoom(input.dataset.roomId, (room) => {
+      room.sensors[input.dataset.sensorKey] = Number(input.value);
+      applyIndustrySensorResponse(room);
+    });
+    return;
+  }
+  if (input.dataset.deviceKind) {
+    updateIndustryRoom(input.dataset.roomId, (room) => {
+      if (input.dataset.deviceKind === "fan") {
+        room.devices.fan.state = "ON";
+        room.devices.fan.speed_percent = Number(input.value);
+        room.devices.fan.speed = fanBandFromPercent(room.devices.fan.speed_percent);
+      } else {
+        room.devices.light.state = "ON";
+        room.devices.light.brightness = Number(input.value);
+      }
+    });
+  }
+});
+
 const runDecisionButton = document.getElementById("runDecisionButton");
 if (runDecisionButton) {
   runDecisionButton.addEventListener("click", async () => {
@@ -1840,6 +2097,8 @@ document.getElementById("viewTabs").addEventListener("click", (event) => {
   });
   document.getElementById("homeView").classList.toggle("active", tab.dataset.view === "home");
   document.getElementById("dashboardView").classList.toggle("active", tab.dataset.view === "dashboard");
+  document.getElementById("industryView").classList.toggle("active", tab.dataset.view === "industry");
+  document.getElementById("dashboard2View").classList.toggle("active", tab.dataset.view === "dashboard-2");
 });
 
 document.getElementById("dashboardRangeTabs").addEventListener("click", (event) => {
@@ -1847,26 +2106,50 @@ document.getElementById("dashboardRangeTabs").addEventListener("click", (event) 
   if (!tab) {
     return;
   }
-  dashboardRange = tab.dataset.range;
-  document.querySelectorAll(".range-chip").forEach((node) => {
+  homeDashboardState.range = tab.dataset.range;
+  document.querySelectorAll("#dashboardRangeTabs .range-chip").forEach((node) => {
     node.classList.toggle("active", node === tab);
   });
   if (latestSnapshot?.dashboard) {
-    renderDashboard(latestSnapshot.dashboard);
+    renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
+      summaryId: "dashboardSummary",
+      comparisonId: "roomComparisonChart",
+      trendChartId: "hourlyTrendChart",
+      trendTitleId: "trendChartTitle",
+      trendSubtitleId: "trendChartSubtitle",
+      recommendationsId: "recommendationsPanel",
+      inefficienciesId: "inefficiencyPanel",
+    });
   }
 });
 
 document.getElementById("dashboardRoomSelect").addEventListener("change", (event) => {
-  dashboardRoomFilter = event.target.value;
+  homeDashboardState.roomFilter = event.target.value;
   if (latestSnapshot?.dashboard) {
-    renderDashboard(latestSnapshot.dashboard);
+    renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
+      summaryId: "dashboardSummary",
+      comparisonId: "roomComparisonChart",
+      trendChartId: "hourlyTrendChart",
+      trendTitleId: "trendChartTitle",
+      trendSubtitleId: "trendChartSubtitle",
+      recommendationsId: "recommendationsPanel",
+      inefficienciesId: "inefficiencyPanel",
+    });
   }
 });
 
 document.getElementById("dashboardTrendSelect").addEventListener("change", (event) => {
-  dashboardTrendWindow = event.target.value;
+  homeDashboardState.trendWindow = event.target.value;
   if (latestSnapshot?.dashboard) {
-    renderDashboard(latestSnapshot.dashboard);
+    renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
+      summaryId: "dashboardSummary",
+      comparisonId: "roomComparisonChart",
+      trendChartId: "hourlyTrendChart",
+      trendTitleId: "trendChartTitle",
+      trendSubtitleId: "trendChartSubtitle",
+      recommendationsId: "recommendationsPanel",
+      inefficienciesId: "inefficiencyPanel",
+    });
   }
 });
 
@@ -1875,12 +2158,94 @@ document.getElementById("dashboardMetricFilters").addEventListener("click", (eve
   if (!tab) {
     return;
   }
-  dashboardMetricFilter = tab.dataset.metricFilter;
-  document.querySelectorAll("[data-metric-filter]").forEach((node) => {
+  homeDashboardState.metricFilter = tab.dataset.metricFilter;
+  document.querySelectorAll("#dashboardMetricFilters [data-metric-filter]").forEach((node) => {
     node.classList.toggle("active", node === tab);
   });
   if (latestSnapshot?.dashboard) {
-    renderDashboard(latestSnapshot.dashboard);
+    renderDashboard(latestSnapshot.dashboard, homeDashboardState, {
+      summaryId: "dashboardSummary",
+      comparisonId: "roomComparisonChart",
+      trendChartId: "hourlyTrendChart",
+      trendTitleId: "trendChartTitle",
+      trendSubtitleId: "trendChartSubtitle",
+      recommendationsId: "recommendationsPanel",
+      inefficienciesId: "inefficiencyPanel",
+    });
+  }
+});
+
+document.getElementById("industryDashboardRangeTabs").addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-range]");
+  if (!tab) {
+    return;
+  }
+  industryDashboardState.range = tab.dataset.range;
+  document.querySelectorAll("#industryDashboardRangeTabs .range-chip").forEach((node) => {
+    node.classList.toggle("active", node === tab);
+  });
+  if (latestIndustryState?.dashboard) {
+    renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
+      summaryId: "industryDashboardSummary",
+      comparisonId: "industryRoomComparisonChart",
+      trendChartId: "industryHourlyTrendChart",
+      trendTitleId: "industryTrendChartTitle",
+      trendSubtitleId: "industryTrendChartSubtitle",
+      recommendationsId: "industryRecommendationsPanel",
+      inefficienciesId: "industryInefficiencyPanel",
+    });
+  }
+});
+
+document.getElementById("industryDashboardRoomSelect").addEventListener("change", (event) => {
+  industryDashboardState.roomFilter = event.target.value;
+  if (latestIndustryState?.dashboard) {
+    renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
+      summaryId: "industryDashboardSummary",
+      comparisonId: "industryRoomComparisonChart",
+      trendChartId: "industryHourlyTrendChart",
+      trendTitleId: "industryTrendChartTitle",
+      trendSubtitleId: "industryTrendChartSubtitle",
+      recommendationsId: "industryRecommendationsPanel",
+      inefficienciesId: "industryInefficiencyPanel",
+    });
+  }
+});
+
+document.getElementById("industryDashboardTrendSelect").addEventListener("change", (event) => {
+  industryDashboardState.trendWindow = event.target.value;
+  if (latestIndustryState?.dashboard) {
+    renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
+      summaryId: "industryDashboardSummary",
+      comparisonId: "industryRoomComparisonChart",
+      trendChartId: "industryHourlyTrendChart",
+      trendTitleId: "industryTrendChartTitle",
+      trendSubtitleId: "industryTrendChartSubtitle",
+      recommendationsId: "industryRecommendationsPanel",
+      inefficienciesId: "industryInefficiencyPanel",
+    });
+  }
+});
+
+document.getElementById("industryDashboardMetricFilters").addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-metric-filter]");
+  if (!tab) {
+    return;
+  }
+  industryDashboardState.metricFilter = tab.dataset.metricFilter;
+  document.querySelectorAll("#industryDashboardMetricFilters [data-metric-filter]").forEach((node) => {
+    node.classList.toggle("active", node === tab);
+  });
+  if (latestIndustryState?.dashboard) {
+    renderDashboard(latestIndustryState.dashboard, industryDashboardState, {
+      summaryId: "industryDashboardSummary",
+      comparisonId: "industryRoomComparisonChart",
+      trendChartId: "industryHourlyTrendChart",
+      trendTitleId: "industryTrendChartTitle",
+      trendSubtitleId: "industryTrendChartSubtitle",
+      recommendationsId: "industryRecommendationsPanel",
+      inefficienciesId: "industryInefficiencyPanel",
+    });
   }
 });
 
